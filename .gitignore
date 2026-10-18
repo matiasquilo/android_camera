@@ -1,0 +1,38 @@
+# Gradle & Build outputs
+.gradle/
+.kotlin/
+build/
+**/build/
+
+# Local configuration
+local.properties
+
+# Android Studio / IntelliJ IDEA
+*.iml
+.idea/caches/
+.idea/libraries/
+.idea/modules.xml
+.idea/workspace.xml
+.idea/navEditor.xml
+.idea/assetWizardSettings.xml
+.idea/deploymentTargetSelector.xml
+.idea/shelf/
+
+# Android Studio captures & native builds
+/captures
+.externalNativeBuild
+.cxx/
+
+# Output artifacts
+*.apk
+*.aar
+*.aab
+*.dex
+
+# Security / Signing keys
+*.jks
+*.keystore
+
+# OS generated files
+.DS_Store
+Thumbs.db
