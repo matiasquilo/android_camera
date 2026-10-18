@@ -5,7 +5,6 @@
 
     <!-- 1. Solicitas el permiso para usar la cámara -->
     <uses-permission android:name="android.permission.CAMERA" />
-    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
 
     <!-- 2. Declaras que la cámara es necesaria, pero puede ser CUALQUIERA (frontal, trasera o externa) -->
     <uses-feature android:name="android.hardware.camera.any" android:required="true" />
