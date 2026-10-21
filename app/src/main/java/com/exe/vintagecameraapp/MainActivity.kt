@@ -30,6 +30,7 @@ import android.view.MotionEvent
 import android.view.OrientationEventListener
 import android.view.ScaleGestureDetector
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
@@ -77,11 +78,14 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -266,7 +270,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        enableEdgeToEdge()
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT)
+        )
 
         orientationEventListener = object : OrientationEventListener(this) {
             override fun onOrientationChanged(orientation: Int) {
@@ -362,6 +369,8 @@ fun CameraPreviewScreen(
     var focusPoint by remember { mutableStateOf<Offset?>(null) }
     var focusOk by remember { mutableStateOf<Boolean?>(null) }
     var status by remember { mutableStateOf<Pair<String, Long>?>(null) }
+    val prefs = remember { context.getSharedPreferences("vintage_prefs", Context.MODE_PRIVATE) }
+    var showDate by remember { mutableStateOf(prefs.getBoolean("show_date", true)) }
     LaunchedEffect(status) {
         if (status != null) {
             delay(1400)
@@ -736,13 +745,23 @@ fun CameraPreviewScreen(
                         captureStartTime = captureStartTime,
                         tapRealtimeNs = tapRealtimeNs,
                         processingCount = processingCount,
+                        drawDate = showDate,
                         onHandedOff = { mainExecutor.execute { capturing = false } },
                         onResult = { resultMsg -> status = resultMsg to System.nanoTime() },
                         onSaved = { bmp, uri -> lastThumb = bmp; lastUri = uri }
                     )
                 }
             )
-            Spacer(Modifier.weight(1f))
+            Box(Modifier.weight(1f), contentAlignment = Alignment.CenterEnd) {
+                DateToggle(
+                    enabled = showDate,
+                    onToggle = {
+                        showDate = !showDate
+                        prefs.edit().putBoolean("show_date", showDate).apply()
+                        status = (if (showDate) "Fecha activada" else "Fecha desactivada") to System.nanoTime()
+                    }
+                )
+            }
         }
     }
 }
@@ -761,6 +780,7 @@ private fun processAndTakePhoto(
     captureStartTime: Long,
     tapRealtimeNs: Long,
     processingCount: AtomicInteger,
+    drawDate: Boolean = true,
     onHandedOff: () -> Unit,
     onResult: (String) -> Unit,
     onSaved: (Bitmap, Uri) -> Unit
@@ -837,7 +857,7 @@ private fun processAndTakePhoto(
                     val rotateMs = lap()
 
                     // Dibujar la fecha ANTES del filtro LUT para que el filtro la integre naturalmente
-                    drawSegmentDate(bitmap, captureDate)
+                    if (drawDate) drawSegmentDate(bitmap, captureDate)
                     val dateMs = lap()
 
                     if (preset != VintagePreset.NORMAL && lut != null) lut.applyInPlace(bitmap)
@@ -1321,3 +1341,50 @@ fun StatusPill(message: String?, modifier: Modifier = Modifier) {
         }
     }
 }
+
+@Composable
+fun DateToggle(enabled: Boolean, onToggle: () -> Unit, modifier: Modifier = Modifier) {
+    val shape = RoundedCornerShape(14.dp)
+    val bg by animateColorAsState(
+        if (enabled) Ui.amber.copy(alpha = 0.16f) else Color.Transparent, label = "dateBg"
+    )
+    val fg by animateColorAsState(if (enabled) Ui.amber else Ui.muted, label = "dateFg")
+
+    // Mes y día de hoy (el mes en el idioma del sistema, sin punto final: "oct." pasa a "OCT")
+    val month = remember {
+        SimpleDateFormat("MMM", Locale.getDefault()).format(Date()).removeSuffix(".").uppercase()
+    }
+    val day = remember { SimpleDateFormat("d", Locale.getDefault()).format(Date()) }
+
+    Box(
+        modifier
+            .size(52.dp)
+            .clip(shape)
+            .background(bg)
+            .border(1.dp, if (enabled) Ui.amber else Ui.hairline, shape)
+            .clickable(onClick = onToggle)
+            .semantics {
+                contentDescription =
+                    if (enabled) "Fecha en la foto: activada" else "Fecha en la foto: desactivada"
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(month, color = fg, fontSize = 10.sp, fontWeight = FontWeight.Medium, letterSpacing = 1.2.sp)
+            Text(day, color = fg, fontFamily = FontFamily.Monospace, fontSize = 19.sp, fontWeight = FontWeight.Medium)
+        }
+        if (!enabled) {
+            // Diagonal que tacha el botón cuando la fecha está apagada
+            Canvas(Modifier.fillMaxSize()) {
+                drawLine(
+                    color = Ui.muted,
+                    start = Offset(size.width * 0.22f, size.height * 0.78f),
+                    end = Offset(size.width * 0.78f, size.height * 0.22f),
+                    strokeWidth = 1.5.dp.toPx(),
+                    cap = StrokeCap.Round
+                )
+            }
+        }
+    }
+}
+
