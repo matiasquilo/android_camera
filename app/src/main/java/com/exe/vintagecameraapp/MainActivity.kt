@@ -2,8 +2,10 @@ package com.exe.vintagecameraapp
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -12,6 +14,8 @@ import android.graphics.Color as AndroidColor
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.media.ExifInterface
+import android.media.ThumbnailUtils
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
@@ -53,7 +57,6 @@ import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -86,6 +89,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.Observer
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlinx.coroutines.Dispatchers
@@ -364,6 +369,26 @@ fun CameraPreviewScreen(
         }
     }
     val evStep = cameraObj?.cameraInfo?.exposureState?.exposureCompensationStep?.toFloat() ?: 1f
+
+    // Thumbnail state
+    var lastThumb by remember { mutableStateOf<Bitmap?>(null) }
+    var lastUri by remember { mutableStateOf<Uri?>(null) }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                photoProcessingExecutor.execute {
+                    val last = loadLastPhoto(context)
+                    mainExecutor.execute {
+                        lastThumb = last?.first
+                        lastUri = last?.second
+                    }
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     // Preset state
     var selectedPreset by remember { mutableStateOf(VintagePreset.NORMAL) }
@@ -664,46 +689,61 @@ fun CameraPreviewScreen(
 
         Spacer(Modifier.height(14.dp))
 
-        // Shot Button
-        ShutterButton(
-            enabled = !capturing,
-            onClick = {
-                capturing = true
-                flashTarget = 0.7f
+        // Shot Button Row
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 28.dp)
+                .padding(bottom = 28.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
+                LastPhotoThumb(
+                    thumb = lastThumb,
+                    onClick = { lastUri?.let { openInGallery(context, it) } }
+                )
+            }
+            ShutterButton(
+                enabled = !capturing,
+                onClick = {
+                    capturing = true
+                    flashTarget = 0.7f
 
-                val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    val vibratorManager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
-                    vibratorManager.defaultVibrator
-                } else {
-                    @Suppress("DEPRECATION")
-                    context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
-                }
+                    val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        val vibratorManager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
+                        vibratorManager.defaultVibrator
+                    } else {
+                        @Suppress("DEPRECATION")
+                        context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                    }
 
-                vibrator.vibrate(
-                    VibrationEffect.createOneShot(
-                        20L,
-                        60
+                    vibrator.vibrate(
+                        VibrationEffect.createOneShot(
+                            20L,
+                            60
+                        )
                     )
-                )
-                val tapRealtimeNs = SystemClock.elapsedRealtimeNanos()
-                val captureStartTime = System.nanoTime()
+                    val tapRealtimeNs = SystemClock.elapsedRealtimeNanos()
+                    val captureStartTime = System.nanoTime()
 
-                processAndTakePhoto(
-                    context = context,
-                    imageCapture = imageCapture,
-                    preset = selectedPreset,
-                    lut = selectedLut,
-                    captureExecutor = captureExecutor,
-                    photoProcessingExecutor = photoProcessingExecutor,
-                    captureStartTime = captureStartTime,
-                    tapRealtimeNs = tapRealtimeNs,
-                    processingCount = processingCount,
-                    onHandedOff = { mainExecutor.execute { capturing = false } },
-                    onResult = { resultMsg -> status = resultMsg to System.nanoTime() }
-                )
-            },
-            modifier = Modifier.padding(bottom = 28.dp)
-        )
+                    processAndTakePhoto(
+                        context = context,
+                        imageCapture = imageCapture,
+                        preset = selectedPreset,
+                        lut = selectedLut,
+                        captureExecutor = captureExecutor,
+                        photoProcessingExecutor = photoProcessingExecutor,
+                        captureStartTime = captureStartTime,
+                        tapRealtimeNs = tapRealtimeNs,
+                        processingCount = processingCount,
+                        onHandedOff = { mainExecutor.execute { capturing = false } },
+                        onResult = { resultMsg -> status = resultMsg to System.nanoTime() },
+                        onSaved = { bmp, uri -> lastThumb = bmp; lastUri = uri }
+                    )
+                }
+            )
+            Spacer(Modifier.weight(1f))
+        }
     }
 }
 
@@ -722,7 +762,8 @@ private fun processAndTakePhoto(
     tapRealtimeNs: Long,
     processingCount: AtomicInteger,
     onHandedOff: () -> Unit,
-    onResult: (String) -> Unit
+    onResult: (String) -> Unit,
+    onSaved: (Bitmap, Uri) -> Unit
 ) {
     val mainExecutor = ContextCompat.getMainExecutor(context)
 
@@ -795,15 +836,17 @@ private fun processAndTakePhoto(
                     }
                     val rotateMs = lap()
 
-                    // Dibujar la fecha ANTES del filtro LUT para que el filtro la integre naturally
+                    // Dibujar la fecha ANTES del filtro LUT para que el filtro la integre naturalmente
                     drawSegmentDate(bitmap, captureDate)
                     val dateMs = lap()
 
                     if (preset != VintagePreset.NORMAL && lut != null) lut.applyInPlace(bitmap)
                     val lutMs = lap()
 
-                    val ok = saveBitmapToGallery(context, bitmap, SAVE_QUALITY)
+                    val uri = saveBitmapToGallery(context, bitmap, SAVE_QUALITY)
+                    val ok = uri != null
                     val saveMs = lap()
+                    val thumb = if (ok) ThumbnailUtils.extractThumbnail(bitmap, 192, 192) else null
                     bitmap.recycle()
 
                     val totalMs = (System.nanoTime() - captureStartTime) / 1_000_000
@@ -815,6 +858,7 @@ private fun processAndTakePhoto(
                     )
                     mainExecutor.execute {
                         onResult(if (ok) "Foto guardada" else "No se pudo guardar la foto")
+                        if (thumb != null && uri != null) onSaved(thumb, uri)
                     }
                 } catch (e: OutOfMemoryError) {
                     Log.e(TAG, "sin memoria", e)
@@ -939,7 +983,7 @@ private fun drawSegmentDate(
 // SAVE TO GALLERY
 // ============================================================
 
-private fun saveBitmapToGallery(context: Context, bitmap: Bitmap, quality: Int): Boolean {
+private fun saveBitmapToGallery(context: Context, bitmap: Bitmap, quality: Int): Uri? {
     val resolver = context.contentResolver
     val values = ContentValues().apply {
         put(MediaStore.MediaColumns.DISPLAY_NAME, "Vintage_${System.currentTimeMillis()}.jpg")
@@ -949,7 +993,7 @@ private fun saveBitmapToGallery(context: Context, bitmap: Bitmap, quality: Int):
             put(MediaStore.Images.Media.IS_PENDING, 1)
         }
     }
-    val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return false
+    val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return null
     return try {
         val written = resolver.openOutputStream(uri)?.let { raw ->
             BufferedOutputStream(raw, 256 * 1024).use { out ->
@@ -961,11 +1005,96 @@ private fun saveBitmapToGallery(context: Context, bitmap: Bitmap, quality: Int):
             val done = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
             resolver.update(uri, done, null, null)
         }
-        true
+        uri
     } catch (e: Exception) {
         Log.e(TAG, "guardando", e)
         resolver.delete(uri, null, null)
-        false
+        null
+    }
+}
+
+// ============================================================
+// GALLERY & THUMBNAIL HELPER FUNCTIONS
+// ============================================================
+
+/** Miniatura cuadrada de una foto, leyendo solo lo necesario (inSampleSize). */
+private fun decodeThumb(context: Context, uri: Uri, target: Int = 192): Bitmap? = try {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+    var sample = 1
+    while (bounds.outWidth / (sample * 2) >= target && bounds.outHeight / (sample * 2) >= target) sample *= 2
+    val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+    val bmp = context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
+    bmp?.let { ThumbnailUtils.extractThumbnail(it, target, target) }
+} catch (e: Exception) {
+    null
+}
+
+/** Última foto que guardó esta app (carpeta Pictures/VintageCamera). Solo Android 10 o más. */
+private fun loadLastPhoto(context: Context): Pair<Bitmap, Uri>? {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
+    return try {
+        val collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        val uri = context.contentResolver.query(
+            collection,
+            arrayOf(MediaStore.Images.Media._ID),
+            "${MediaStore.Images.Media.RELATIVE_PATH} LIKE ?",
+            arrayOf("Pictures/VintageCamera%"),
+            "${MediaStore.Images.Media.DATE_ADDED} DESC"
+        )?.use { c ->
+            if (c.moveToFirst()) ContentUris.withAppendedId(collection, c.getLong(0)) else null
+        } ?: return null
+        val bmp = decodeThumb(context, uri) ?: return null
+        bmp to uri
+    } catch (e: Exception) {
+        null
+    }
+}
+
+private fun openInGallery(context: Context, uri: Uri) {
+    try {
+        context.startActivity(
+            Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "image/jpeg")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+        )
+    } catch (e: Exception) {
+        Log.e(TAG, "abrir galería", e)
+    }
+}
+
+/** Miniatura redondeada. Hace un pequeño «pop» cada vez que llega una foto nueva. */
+@Composable
+fun LastPhotoThumb(thumb: Bitmap?, onClick: () -> Unit, modifier: Modifier = Modifier) {
+    val shape = RoundedCornerShape(14.dp)
+    val pop = remember { Animatable(1f) }
+    LaunchedEffect(thumb) {
+        if (thumb != null) {
+            pop.snapTo(0.8f)
+            pop.animateTo(1f, tween(180))
+        }
+    }
+    Box(
+        modifier
+            .size(52.dp)
+            .graphicsLayer {
+                scaleX = pop.value
+                scaleY = pop.value
+            }
+            .clip(shape)
+            .border(1.dp, Ui.hairline, shape)
+            .clickable(enabled = thumb != null, onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        if (thumb != null) {
+            Image(
+                bitmap = thumb.asImageBitmap(),
+                contentDescription = "Última foto",
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
     }
 }
 
