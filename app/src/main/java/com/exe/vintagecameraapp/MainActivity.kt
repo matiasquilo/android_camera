@@ -11,8 +11,10 @@ import android.graphics.Canvas
 import android.graphics.Color as AndroidColor
 import android.graphics.Matrix
 import android.graphics.Paint
+import android.media.ExifInterface
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -23,7 +25,6 @@ import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.OrientationEventListener
 import android.view.ScaleGestureDetector
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -43,15 +44,23 @@ import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -61,14 +70,18 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -77,21 +90,24 @@ import androidx.lifecycle.Observer
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.io.BufferedOutputStream
+import java.io.ByteArrayInputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
+import kotlin.math.roundToInt
 import kotlin.math.tan
 
 private const val TAG = "Vintage"
-private const val SHOW_TIMINGS = true    // ponelo en false cuando termines de medir
-private const val SAVE_QUALITY = 92      // antes 95; casi no se nota y comprime más rápido
+private const val SAVE_QUALITY = 92      // casi no se nota y comprime más rápido
 
 private val DIGIT_SEGMENTS = mapOf(
     '0' to "abcdef", '1' to "bc",     '2' to "abged", '3' to "abgcd", '4' to "fgbc",
@@ -159,10 +175,11 @@ class Lut3D(bitmap: Bitmap) {
         val px = IntArray(w * h)
         bitmap.getPixels(px, 0, w, 0, 0, w, h)
 
-        val n = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
+        val n = 2
         val chunk = (px.size + n - 1) / n
         (0 until n).map { t ->
             thread {
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
                 val end = minOf(px.size, (t + 1) * chunk)
                 for (i in t * chunk until end) px[i] = map(px[i])
             }
@@ -275,7 +292,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             Surface(
                 modifier = Modifier.fillMaxSize(),
-                color = Color.Black
+                color = Ui.bg
             ) {
                 if (hasCameraPermission) {
                     CameraPreviewScreen(
@@ -310,9 +327,18 @@ fun CameraPreviewScreen(
     val mainExecutor = remember { ContextCompat.getMainExecutor(context) }
     val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
     val captureExecutor = remember { Executors.newSingleThreadExecutor() }
-    val photoProcessingExecutor = remember { Executors.newSingleThreadExecutor() }
+    val photoProcessingExecutor = remember {
+        Executors.newSingleThreadExecutor { r ->
+            Thread {
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+                r.run()
+            }
+        }
+    }
     val previewProcessor = remember { PreviewProcessor() }
     val overlayShown = remember { AtomicBoolean(false) }
+    val processingCount = remember { AtomicInteger(0) }
+    var capturing by remember { mutableStateOf(false) }
 
     // Shutter flash animation
     var flashTarget by remember { mutableFloatStateOf(0f) }
@@ -329,6 +355,15 @@ fun CameraPreviewScreen(
     var exposureRange by remember { mutableStateOf(-1..1) }
     var zoomRatio by remember { mutableFloatStateOf(1f) }
     var focusPoint by remember { mutableStateOf<Offset?>(null) }
+    var focusOk by remember { mutableStateOf<Boolean?>(null) }
+    var status by remember { mutableStateOf<Pair<String, Long>?>(null) }
+    LaunchedEffect(status) {
+        if (status != null) {
+            delay(1400)
+            status = null
+        }
+    }
+    val evStep = cameraObj?.cameraInfo?.exposureState?.exposureCompensationStep?.toFloat() ?: 1f
 
     // Preset state
     var selectedPreset by remember { mutableStateOf(VintagePreset.NORMAL) }
@@ -418,7 +453,9 @@ fun CameraPreviewScreen(
 
     // UI
     Column(
-        modifier = modifier.statusBarsPadding(),
+        modifier = modifier
+            .background(Ui.bg)
+            .statusBarsPadding(),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Spacer(Modifier.height(12.dp))
@@ -426,13 +463,11 @@ fun CameraPreviewScreen(
         // Viewfinder
         Box(
             modifier = Modifier
-                .padding(horizontal = 16.dp)
+                .padding(horizontal = 12.dp)
                 .weight(1f, fill = false)
                 .aspectRatio(3f / 4f)
-                .border(
-                    BorderStroke(1.dp, Color.DarkGray),
-                    RoundedCornerShape(4.dp)
-                )
+                .clip(RoundedCornerShape(24.dp))
+                .border(1.dp, Ui.hairline, RoundedCornerShape(24.dp))
         ) {
             if (cameraProvider != null) {
                 AndroidView<PreviewView>(
@@ -461,10 +496,14 @@ fun CameraPreviewScreen(
                                 override fun onSingleTapUp(e: MotionEvent): Boolean {
                                     val point = previewView.meteringPointFactory.createPoint(e.x, e.y)
                                     focusPoint = Offset(e.x, e.y)
+                                    focusOk = null
 
-                                    cameraObj?.cameraControl?.startFocusAndMetering(
+                                    val future = cameraObj?.cameraControl?.startFocusAndMetering(
                                         FocusMeteringAction.Builder(point).build()
                                     )
+                                    future?.addListener({
+                                        focusOk = try { future.get().isFocusSuccessful } catch (ex: Exception) { false }
+                                    }, ContextCompat.getMainExecutor(ctx))
 
                                     exposureIndex = 0f
                                     cameraObj?.cameraControl?.setExposureCompensationIndex(0)
@@ -507,7 +546,8 @@ fun CameraPreviewScreen(
                         imageAnalysis.setAnalyzer(analysisExecutor) { image ->
                             try {
                                 val now = System.nanoTime()
-                                if (now - lastFrameTime < 33_000_000L) return@setAnalyzer
+                                val minGap = if (processingCount.get() > 0) 100_000_000L else 33_000_000L
+                                if (now - lastFrameTime < minGap) return@setAnalyzer
                                 lastFrameTime = now
 
                                 val preset = selectedPresetReference.get()
@@ -547,7 +587,7 @@ fun CameraPreviewScreen(
 
                         } catch (exc: Exception) {
                             Log.e(TAG, "Error iniciando cámara", exc)
-                            Toast.makeText(context, "Error iniciando cámara", Toast.LENGTH_SHORT).show()
+                            status = "Error iniciando cámara" to System.nanoTime()
                         }
 
                         previewView
@@ -565,13 +605,20 @@ fun CameraPreviewScreen(
 
                 CameraGrid(Modifier.fillMaxSize())
 
-                FocusIndicator(focusPoint)
+                FocusIndicator(focusPoint, focusOk) { focusPoint = null }
 
                 ZoomIndicator(
                     zoom = zoomRatio,
                     modifier = Modifier
                         .align(Alignment.TopEnd)
                         .padding(12.dp)
+                )
+
+                StatusPill(
+                    message = status?.first,
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 14.dp)
                 )
 
                 if (flashAlpha > 0f) {
@@ -584,73 +631,44 @@ fun CameraPreviewScreen(
             }
         }
 
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(18.dp))
 
         // Presets
         LazyRow(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp),
-            horizontalArrangement = Arrangement.Center
+            modifier = Modifier.fillMaxWidth(),
+            contentPadding = PaddingValues(horizontal = 16.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterHorizontally)
         ) {
             items(VintagePreset.entries) { preset ->
-                PresetItem(
-                    preset = preset,
-                    isSelected = selectedPreset == preset
-                ) {
-                    selectedPreset = preset
-                }
+                PresetChip(preset, selectedPreset == preset) { selectedPreset = preset }
             }
         }
 
-        Spacer(Modifier.height(12.dp))
+        Spacer(Modifier.height(14.dp))
 
-        // Exposure Slider
-        if (cameraObj != null) {
-            Row(
+        // Exposure Control
+        if (cameraObj != null && exposureRange.last > exposureRange.first) {
+            ExposureControl(
+                index = exposureIndex,
+                range = exposureRange,
+                stepEv = evStep,
+                onChange = {
+                    exposureIndex = it
+                    cameraObj?.cameraControl?.setExposureCompensationIndex(it.roundToInt())
+                },
                 modifier = Modifier
-                    .padding(horizontal = 32.dp)
-                    .fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = "EV",
-                    color = Color.White,
-                    style = MaterialTheme.typography.labelSmall
-                )
-
-                Slider(
-                    value = exposureIndex,
-                    onValueChange = {
-                        exposureIndex = it
-                        cameraObj?.cameraControl?.setExposureCompensationIndex(it.toInt())
-                    },
-                    valueRange = exposureRange.first.toFloat()..exposureRange.last.toFloat(),
-                    steps = if (exposureRange.last > exposureRange.first) {
-                        exposureRange.last - exposureRange.first - 1
-                    } else {
-                        0
-                    },
-                    modifier = Modifier.weight(1f),
-                    colors = SliderDefaults.colors(
-                        thumbColor = Color(0xFFD1C4E9),
-                        activeTrackColor = Color(0xFF7E57C2)
-                    )
-                )
-
-                Text(
-                    text = exposureIndex.toInt().toString(),
-                    color = Color.White,
-                    style = MaterialTheme.typography.labelSmall
-                )
-            }
+                    .padding(horizontal = 28.dp)
+                    .fillMaxWidth()
+            )
         }
 
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(14.dp))
 
         // Shot Button
-        Button(
+        ShutterButton(
+            enabled = !capturing,
             onClick = {
+                capturing = true
                 flashTarget = 0.7f
 
                 val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -663,10 +681,11 @@ fun CameraPreviewScreen(
 
                 vibrator.vibrate(
                     VibrationEffect.createOneShot(
-                        70L,
-                        VibrationEffect.DEFAULT_AMPLITUDE
+                        20L,
+                        60
                     )
                 )
+                val tapRealtimeNs = SystemClock.elapsedRealtimeNanos()
                 val captureStartTime = System.nanoTime()
 
                 processAndTakePhoto(
@@ -676,58 +695,14 @@ fun CameraPreviewScreen(
                     lut = selectedLut,
                     captureExecutor = captureExecutor,
                     photoProcessingExecutor = photoProcessingExecutor,
-                    captureStartTime = captureStartTime
+                    captureStartTime = captureStartTime,
+                    tapRealtimeNs = tapRealtimeNs,
+                    processingCount = processingCount,
+                    onHandedOff = { mainExecutor.execute { capturing = false } },
+                    onResult = { resultMsg -> status = resultMsg to System.nanoTime() }
                 )
             },
-            modifier = Modifier
-                .padding(bottom = 32.dp)
-                .size(86.dp)
-                .border(2.dp, Color(0xFFB39DDB), CircleShape),
-            shape = CircleShape,
-            colors = ButtonDefaults.buttonColors(
-                containerColor = Color(0xFF673AB7)
-            )
-        ) {
-            Text(
-                text = "SHOT",
-                color = Color.White,
-                fontWeight = FontWeight.Bold
-            )
-        }
-    }
-}
-
-// ============================================================
-// PRESET ITEM
-// ============================================================
-
-@Composable
-fun PresetItem(
-    preset: VintagePreset,
-    isSelected: Boolean,
-    onClick: () -> Unit
-) {
-    Box(
-        modifier = Modifier
-            .padding(horizontal = 8.dp)
-            .size(width = 64.dp, height = 32.dp)
-            .background(
-                if (isSelected) Color(0xFF673AB7) else Color.Transparent,
-                RoundedCornerShape(4.dp)
-            )
-            .border(
-                1.dp,
-                if (isSelected) Color.White else Color.Gray,
-                RoundedCornerShape(4.dp)
-            )
-            .clickable { onClick() },
-        contentAlignment = Alignment.Center
-    ) {
-        Text(
-            text = preset.label,
-            color = Color.White,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.Bold
+            modifier = Modifier.padding(bottom = 28.dp)
         )
     }
 }
@@ -743,7 +718,11 @@ private fun processAndTakePhoto(
     lut: Lut3D?,
     captureExecutor: ExecutorService,
     photoProcessingExecutor: ExecutorService,
-    captureStartTime: Long
+    captureStartTime: Long,
+    tapRealtimeNs: Long,
+    processingCount: AtomicInteger,
+    onHandedOff: () -> Unit,
+    onResult: (String) -> Unit
 ) {
     val mainExecutor = ContextCompat.getMainExecutor(context)
 
@@ -752,16 +731,24 @@ private fun processAndTakePhoto(
         override fun onCaptureSuccess(image: ImageProxy) {
             val shutterMs = (System.nanoTime() - captureStartTime) / 1_000_000
             val captureDate = Date()
+            val frameTimestampNs = image.imageInfo.timestamp
+            val frameOffsetMs = (frameTimestampNs - tapRealtimeNs) / 1_000_000
 
             val buffer = image.planes.firstOrNull()?.buffer
-            if (buffer == null) { image.close(); return }
+            if (buffer == null) {
+                image.close()
+                onHandedOff()
+                return
+            }
             buffer.rewind()
             val jpegBytes = ByteArray(buffer.remaining())
             buffer.get(jpegBytes)
             val rotationDegrees = image.imageInfo.rotationDegrees
             val queuedAt = System.nanoTime()
             image.close()
+            onHandedOff()
 
+            processingCount.incrementAndGet()
             photoProcessingExecutor.execute {
                 val waitMs = (System.nanoTime() - queuedAt) / 1_000_000
                 var mark = System.nanoTime()
@@ -772,6 +759,14 @@ private fun processAndTakePhoto(
                     return d
                 }
 
+                val expInfo = try {
+                    val exif = ExifInterface(ByteArrayInputStream(jpegBytes))
+                    val exp = exif.getAttribute(ExifInterface.TAG_EXPOSURE_TIME)?.toDoubleOrNull()
+                    val iso = exif.getAttribute(ExifInterface.TAG_ISO_SPEED_RATINGS)
+                    val expTxt = if (exp != null && exp > 0 && exp < 1) "1/${Math.round(1.0 / exp)} s" else "${exp ?: "?"} s"
+                    "exp $expTxt · ISO ${iso ?: "?"}"
+                } catch (e: Exception) { "exp ?" }
+
                 try {
                     val opts = BitmapFactory.Options().apply {
                         inMutable = true
@@ -780,7 +775,7 @@ private fun processAndTakePhoto(
                     var bitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size, opts)
                     if (bitmap == null) {
                         mainExecutor.execute {
-                            Toast.makeText(context, "No se pudo procesar la imagen", Toast.LENGTH_SHORT).show()
+                            onResult("No se pudo procesar la imagen")
                         }
                         return@execute
                     }
@@ -800,7 +795,7 @@ private fun processAndTakePhoto(
                     }
                     val rotateMs = lap()
 
-                    // Dibujar la fecha ANTES del filtro LUT para que el filtro la integre naturalmente
+                    // Dibujar la fecha ANTES del filtro LUT para que el filtro la integre naturally
                     drawSegmentDate(bitmap, captureDate)
                     val dateMs = lap()
 
@@ -812,41 +807,36 @@ private fun processAndTakePhoto(
                     bitmap.recycle()
 
                     val totalMs = (System.nanoTime() - captureStartTime) / 1_000_000
-                    val msg = buildString {
-                        append(if (ok) "¡Captura Vintage!" else "Error guardando la foto")
-                        if (SHOW_TIMINGS) {
-                            append("\nFoto de %.1f MP".format(megapixels))
-                            append("\ndisparo $shutterMs ms · espera cola $waitMs ms")
-                            append("\ndecodificar $decodeMs · rotar $rotateMs · filtro $lutMs")
-                            append("\nfecha $dateMs · guardar $saveMs")
-                            append("\nTOTAL $totalMs ms")
-                        }
-                    }
-                    Log.d(TAG, msg.replace("\n", " | "))
+                    Log.d(
+                        TAG,
+                        "disparo=${shutterMs}ms cola=${waitMs}ms decod=$decodeMs rot=$rotateMs " +
+                                "fecha=$dateMs filtro=$lutMs guardar=$saveMs total=${totalMs}ms " +
+                                "(${"%.1f".format(megapixels)} MP) frame vs toque ${if (frameOffsetMs >= 0) "+" else ""}$frameOffsetMs ms · $expInfo"
+                    )
                     mainExecutor.execute {
-                        Toast.makeText(
-                            context, msg,
-                            if (SHOW_TIMINGS) Toast.LENGTH_LONG else Toast.LENGTH_SHORT
-                        ).show()
+                        onResult(if (ok) "Foto guardada" else "No se pudo guardar la foto")
                     }
                 } catch (e: OutOfMemoryError) {
                     Log.e(TAG, "sin memoria", e)
                     mainExecutor.execute {
-                        Toast.makeText(context, "Sin memoria para procesar la foto", Toast.LENGTH_SHORT).show()
+                        onResult("Sin memoria para procesar la foto")
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "procesando foto", e)
                     mainExecutor.execute {
-                        Toast.makeText(context, "Error al procesar la foto", Toast.LENGTH_SHORT).show()
+                        onResult("Error al procesar la foto")
                     }
+                } finally {
+                    processingCount.decrementAndGet()
                 }
             }
         }
 
         override fun onError(exception: ImageCaptureException) {
             Log.e(TAG, "captura", exception)
+            onHandedOff()
             mainExecutor.execute {
-                Toast.makeText(context, "Error al tomar la foto", Toast.LENGTH_SHORT).show()
+                onResult("Error al tomar la foto")
             }
         }
     })
@@ -869,10 +859,10 @@ private fun drawSegmentDate(
     val k = tan(Math.toRadians(7.0)).toFloat()   // inclinación
     val s = t                               // hueco entre segmentos
     val step = w + t + h * 0.04f            // avance entre dígitos
-    val groupGap = h * 0.65f                // espacio acortado entre año, mes y día (antes 0.95f)
-    val apostropheGap = h * 0.55f           // del apóstrofo al primer dígito (antes 0.88f)
+    val groupGap = h * 0.65f                // espacio acortado entre año, mes y día
+    val apostropheGap = h * 0.55f           // del apóstrofo al primer dígito
     val marginX = width * 0.03f
-    val marginY = width * 0.06f                  // duplicado desde el fondo hacia arriba (antes 0.03f)
+    val marginY = width * 0.06f                  // duplicado desde el fondo hacia arriba
 
     val year = SimpleDateFormat("yy", Locale.US).format(date)
     val month = SimpleDateFormat("M", Locale.US).format(date)
@@ -904,7 +894,7 @@ private fun drawSegmentDate(
 
     val canvas = Canvas(bitmap)
     
-    // Pincel principal de la fecha con difuminado óptico de LED un poco más definido
+    // Pincel principal de la fecha con difuminado óptico de LED
     val paint = Paint().apply {
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
@@ -980,66 +970,6 @@ private fun saveBitmapToGallery(context: Context, bitmap: Bitmap, quality: Int):
 }
 
 // ============================================================
-// FOCUS INDICATOR
-// ============================================================
-
-@Composable
-fun FocusIndicator(
-    point: Offset?
-) {
-    if (point == null) return
-
-    val anim = remember { Animatable(0.6f) }
-
-    LaunchedEffect(point) {
-        anim.snapTo(0.6f)
-        anim.animateTo(1.3f, tween(250))
-        anim.animateTo(1.0f, tween(150))
-    }
-
-    Box(
-        Modifier
-            .offset(
-                with(LocalDensity.current) { point.x.toDp() } - 30.dp,
-                with(LocalDensity.current) { point.y.toDp() } - 30.dp
-            )
-            .size(60.dp)
-            .scale(anim.value)
-            .border(
-                2.dp,
-                Color.White.copy(alpha = 0.8f),
-                CircleShape
-            )
-    )
-}
-
-// ============================================================
-// ZOOM INDICATOR
-// ============================================================
-
-@Composable
-fun ZoomIndicator(
-    zoom: Float,
-    modifier: Modifier
-) {
-    Box(
-        modifier
-            .background(
-                Color.Black.copy(alpha = 0.5f),
-                RoundedCornerShape(4.dp)
-            )
-            .padding(4.dp)
-    ) {
-        Text(
-            text = "%.1fx".format(zoom),
-            color = Color.White,
-            fontSize = 12.sp,
-            fontWeight = FontWeight.Bold
-        )
-    }
-}
-
-// ============================================================
 // GRID
 // ============================================================
 
@@ -1048,7 +978,7 @@ fun CameraGrid(
     modifier: Modifier
 ) {
     Canvas(modifier) {
-        val color = Color.White.copy(alpha = 0.3f)
+        val color = Color.White.copy(alpha = 0.22f)
 
         drawLine(
             color,
@@ -1077,5 +1007,188 @@ fun CameraGrid(
             Offset(size.width, 2 * size.height / 3),
             1.dp.toPx()
         )
+    }
+}
+
+// ============================================================
+// UI MINIMALISTA
+// ============================================================
+
+private object Ui {
+    val bg = Color(0xFF0B0B0D)
+    val hairline = Color(0xFF2A2A2F)
+    val text = Color(0xFFF2EDE6)
+    val muted = Color(0xFF8C877E)
+    val amber = Color(0xFFE8892B)
+}
+
+/** Círculo de enfoque: aparece, se asienta, y desaparece solo en ~1 segundo. */
+@Composable
+fun FocusIndicator(point: Offset?, focused: Boolean?, onFinished: () -> Unit) {
+    if (point == null) return
+    val grow = remember { Animatable(1.5f) }
+    val fade = remember { Animatable(1f) }
+    LaunchedEffect(point) {
+        fade.snapTo(1f)
+        grow.snapTo(1.5f)
+        grow.animateTo(1f, tween(200))
+        delay(550)
+        fade.animateTo(0f, tween(250))
+        onFinished()
+    }
+    // Ámbar si la cámara confirmó el enfoque, blanco mientras tanto
+    val ringColor by animateColorAsState(if (focused == true) Ui.amber else Ui.text, label = "focusColor")
+    val density = LocalDensity.current
+    Box(
+        Modifier
+            .offset(
+                with(density) { point.x.toDp() } - 32.dp,
+                with(density) { point.y.toDp() } - 32.dp
+            )
+            .size(64.dp)
+            .graphicsLayer {
+                scaleX = grow.value
+                scaleY = grow.value
+                alpha = fade.value
+            }
+            .border(1.5.dp, ringColor, CircleShape)
+    )
+}
+
+@Composable
+fun ZoomIndicator(zoom: Float, modifier: Modifier) {
+    Box(
+        modifier
+            .background(Color.Black.copy(alpha = 0.45f), RoundedCornerShape(50))
+            .padding(horizontal = 10.dp, vertical = 5.dp)
+    ) {
+        Text(
+            text = "%.1fx".format(zoom),
+            color = Ui.text,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium,
+            letterSpacing = 0.8.sp
+        )
+    }
+}
+
+@Composable
+fun PresetChip(preset: VintagePreset, isSelected: Boolean, onClick: () -> Unit) {
+    val shape = RoundedCornerShape(50)
+    val bg by animateColorAsState(
+        if (isSelected) Ui.amber.copy(alpha = 0.16f) else Color.Transparent, label = "chipBg"
+    )
+    val fg by animateColorAsState(if (isSelected) Ui.amber else Ui.muted, label = "chipFg")
+    Box(
+        Modifier
+            .clip(shape)
+            .background(bg)
+            .border(1.dp, if (isSelected) Ui.amber else Ui.hairline, shape)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = preset.label,
+            color = fg,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Medium,
+            letterSpacing = 1.4.sp
+        )
+    }
+}
+
+/** Barra de exposición manual. Muestra EV real (índice × paso de la cámara), no el índice crudo. */
+@Composable
+fun ExposureControl(
+    index: Float,
+    range: IntRange,
+    stepEv: Float,
+    onChange: (Float) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val i = index.roundToInt()
+    val label = if (i == 0) "0.0" else "%+.1f".format(i * stepEv)
+    Row(modifier, verticalAlignment = Alignment.CenterVertically) {
+        Text("EV", color = Ui.muted, fontSize = 11.sp, fontWeight = FontWeight.Medium, letterSpacing = 1.4.sp)
+        Slider(
+            value = index,
+            onValueChange = onChange,
+            valueRange = range.first.toFloat()..range.last.toFloat(),
+            steps = (range.last - range.first - 1).coerceAtLeast(0),
+            modifier = Modifier
+                .weight(1f)
+                .padding(horizontal = 12.dp),
+            colors = SliderDefaults.colors(
+                thumbColor = Ui.text,
+                activeTrackColor = Ui.amber,
+                inactiveTrackColor = Ui.hairline,
+                activeTickColor = Color.Transparent,
+                inactiveTickColor = Color.Transparent
+            )
+        )
+        Text(
+            text = label,
+            color = Ui.text,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 12.sp,
+            textAlign = TextAlign.End,
+            modifier = Modifier.width(40.dp)
+        )
+    }
+}
+
+/** Botón de disparo: anillo + círculo interior que se achica al apretar. */
+@Composable
+fun ShutterButton(
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true
+) {
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    val inner by animateDpAsState(
+        targetValue = if (pressed) 52.dp else if (enabled) 62.dp else 46.dp,
+        animationSpec = tween(90),
+        label = "shutterInner"
+    )
+    val tone = if (enabled) Ui.text else Ui.muted
+    Box(
+        modifier
+            .size(80.dp)
+            .border(3.dp, tone, CircleShape)
+            .clickable(
+                interactionSource = interaction,
+                indication = null,
+                enabled = enabled,
+                onClick = onClick
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        Box(Modifier.size(inner).background(tone, CircleShape))
+    }
+}
+
+/** Aviso breve sobre el visor ("Foto guardada"). Se muestra con `message != null`. */
+@Composable
+fun StatusPill(message: String?, modifier: Modifier = Modifier) {
+    var last by remember { mutableStateOf("") }
+    LaunchedEffect(message) { if (message != null) last = message }
+    AnimatedVisibility(
+        visible = message != null,
+        enter = fadeIn(tween(120)) + slideInVertically(tween(160)) { it / 2 },
+        exit = fadeOut(tween(250)),
+        modifier = modifier
+    ) {
+        Row(
+            Modifier
+                .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(50))
+                .padding(horizontal = 14.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(Modifier.size(6.dp).background(Ui.amber, CircleShape))
+            Spacer(Modifier.width(8.dp))
+            Text(message ?: last, color = Ui.text, fontSize = 12.sp, letterSpacing = 0.6.sp)
+        }
     }
 }
