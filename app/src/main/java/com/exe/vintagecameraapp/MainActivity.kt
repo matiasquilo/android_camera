@@ -77,8 +77,19 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
+import android.graphics.ImageFormat
+import android.hardware.camera2.CameraCharacteristics
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
@@ -112,11 +123,14 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
+import kotlin.math.atan
 import kotlin.math.roundToInt
 import kotlin.math.tan
 
 private const val TAG = "Vintage"
 private const val SAVE_QUALITY = 92      // casi no se nota y comprime más rápido
+private const val HIGH_RES = false       // true = 12,5 MP (4080x3072), probablemente más lento
+private const val LOCK_EXPOSURE = true   // false = bloquea solo el enfoque
 
 private val DIGIT_SEGMENTS = mapOf(
     '0' to "abcdef", '1' to "bc",     '2' to "abged", '3' to "abgcd", '4' to "fgbc",
@@ -368,9 +382,29 @@ fun CameraPreviewScreen(
     var zoomRatio by remember { mutableFloatStateOf(1f) }
     var focusPoint by remember { mutableStateOf<Offset?>(null) }
     var focusOk by remember { mutableStateOf<Boolean?>(null) }
+    var focusLocked by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf<Pair<String, Long>?>(null) }
     val prefs = remember { context.getSharedPreferences("vintage_prefs", Context.MODE_PRIVATE) }
     var showDate by remember { mutableStateOf(prefs.getBoolean("show_date", true)) }
+    var flashOn by remember { mutableStateOf(false) }
+    val hasFlash = cameraObj?.cameraInfo?.hasFlashUnit() == true
+    var debugInfo by remember { mutableStateOf<String?>(null) }
+
+    debugInfo?.let { text ->
+        AlertDialog(
+            onDismissRequest = { debugInfo = null },
+            confirmButton = { TextButton(onClick = { debugInfo = null }) { Text("Cerrar") } },
+            title = { Text("Resoluciones de la cámara") },
+            text = {
+                Text(
+                    text,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 12.sp,
+                    modifier = Modifier.verticalScroll(rememberScrollState())
+                )
+            }
+        )
+    }
     LaunchedEffect(status) {
         if (status != null) {
             delay(1400)
@@ -449,10 +483,13 @@ fun CameraPreviewScreen(
         .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
         .setResolutionStrategy(
             ResolutionStrategy(
-                Size(4000, 3000),
+                if (HIGH_RES) Size(4080, 3072) else Size(3264, 2448),
                 ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER
             )
         )
+        .apply {
+            if (HIGH_RES) setAllowedResolutionMode(ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE)
+        }
         .build()
 
     val imageCapture = remember {
@@ -528,6 +565,7 @@ fun CameraPreviewScreen(
                             object : GestureDetector.SimpleOnGestureListener() {
                                 @SuppressLint("ClickableViewAccessibility")
                                 override fun onSingleTapUp(e: MotionEvent): Boolean {
+                                    focusLocked = false
                                     val point = previewView.meteringPointFactory.createPoint(e.x, e.y)
                                     focusPoint = Offset(e.x, e.y)
                                     focusOk = null
@@ -542,6 +580,23 @@ fun CameraPreviewScreen(
                                     exposureIndex = 0f
                                     cameraObj?.cameraControl?.setExposureCompensationIndex(0)
                                     return true
+                                }
+
+                                override fun onLongPress(e: MotionEvent) {
+                                    val point = previewView.meteringPointFactory.createPoint(e.x, e.y)
+                                    focusPoint = Offset(e.x, e.y)
+                                    focusLocked = true
+                                    focusOk = null
+                                    val flags = if (LOCK_EXPOSURE) FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE
+                                                else FocusMeteringAction.FLAG_AF
+                                    val action = FocusMeteringAction.Builder(point, flags)
+                                        .disableAutoCancel()
+                                        .build()
+                                    val future = cameraObj?.cameraControl?.startFocusAndMetering(action)
+                                    future?.addListener({
+                                        focusOk = try { future.get().isFocusSuccessful } catch (ex: Exception) { false }
+                                    }, ContextCompat.getMainExecutor(ctx))
+                                    status = "Enfoque y exposición bloqueados" to System.nanoTime()
                                 }
                             }
                         )
@@ -639,13 +694,39 @@ fun CameraPreviewScreen(
 
                 CameraGrid(Modifier.fillMaxSize())
 
-                FocusIndicator(focusPoint, focusOk) { focusPoint = null }
+                FocusIndicator(focusPoint, focusOk, focusLocked) {
+                    focusPoint = null
+                    focusLocked = false
+                }
+
+                if (hasFlash) {
+                    FlashToggle(
+                        enabled = flashOn,
+                        onToggle = {
+                            flashOn = !flashOn
+                            imageCapture.flashMode =
+                                if (flashOn) ImageCapture.FLASH_MODE_ON else ImageCapture.FLASH_MODE_OFF
+                            status = (if (flashOn) "Flash activado" else "Flash desactivado") to System.nanoTime()
+                        },
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .padding(top = 10.dp)
+                    )
+                }
 
                 ZoomIndicator(
                     zoom = zoomRatio,
                     modifier = Modifier
                         .align(Alignment.TopEnd)
                         .padding(12.dp)
+                        .pointerInput(Unit) {
+                            detectTapGestures(onLongPress = {
+                                cameraObj?.let {
+                                    debugInfo = describeCameraResolutions(it, imageCapture) + "\n\n" +
+                                        describeAllCameras(cameraProviderState.value)
+                                }
+                            })
+                        }
                 )
 
                 StatusPill(
@@ -1173,20 +1254,22 @@ private object Ui {
 
 /** Círculo de enfoque: aparece, se asienta, y desaparece solo en ~1 segundo. */
 @Composable
-fun FocusIndicator(point: Offset?, focused: Boolean?, onFinished: () -> Unit) {
+fun FocusIndicator(point: Offset?, focused: Boolean?, locked: Boolean, onFinished: () -> Unit) {
     if (point == null) return
     val grow = remember { Animatable(1.5f) }
     val fade = remember { Animatable(1f) }
-    LaunchedEffect(point) {
+    LaunchedEffect(point, locked) {
         fade.snapTo(1f)
         grow.snapTo(1.5f)
         grow.animateTo(1f, tween(200))
+        if (locked) return@LaunchedEffect
         delay(550)
         fade.animateTo(0f, tween(250))
         onFinished()
     }
-    // Ámbar si la cámara confirmó el enfoque, blanco mientras tanto
-    val ringColor by animateColorAsState(if (focused == true) Ui.amber else Ui.text, label = "focusColor")
+    val ringColor by animateColorAsState(
+        if (locked || focused == true) Ui.amber else Ui.text, label = "focusColor"
+    )
     val density = LocalDensity.current
     Box(
         Modifier
@@ -1195,13 +1278,30 @@ fun FocusIndicator(point: Offset?, focused: Boolean?, onFinished: () -> Unit) {
                 with(density) { point.y.toDp() } - 32.dp
             )
             .size(64.dp)
-            .graphicsLayer {
-                scaleX = grow.value
-                scaleY = grow.value
-                alpha = fade.value
-            }
-            .border(1.5.dp, ringColor, CircleShape)
-    )
+    ) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .graphicsLayer {
+                    scaleX = grow.value
+                    scaleY = grow.value
+                    alpha = fade.value
+                }
+                .border(1.5.dp, ringColor, CircleShape)
+        )
+        if (locked) {
+            Text(
+                "AE/AF",
+                color = Ui.amber,
+                fontSize = 9.sp,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = 1.sp,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .offset(y = 16.dp)
+            )
+        }
+    }
 }
 
 @Composable
@@ -1386,5 +1486,110 @@ fun DateToggle(enabled: Boolean, onToggle: () -> Unit, modifier: Modifier = Modi
             }
         }
     }
+}
+
+@Composable
+fun FlashToggle(enabled: Boolean, onToggle: () -> Unit, modifier: Modifier = Modifier) {
+    val tint by animateColorAsState(
+        if (enabled) Ui.amber else Color.White.copy(alpha = 0.45f), label = "flashTint"
+    )
+    Box(
+        modifier
+            .size(44.dp)
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = onToggle
+            )
+            .semantics {
+                contentDescription = if (enabled) "Flash: activado" else "Flash: desactivado"
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        Canvas(Modifier.size(22.dp)) {
+            val s = size.width / 24f
+            val bolt = Path().apply {
+                moveTo(13f * s, 2f * s)
+                lineTo(4.5f * s, 13.5f * s)
+                lineTo(11f * s, 13.5f * s)
+                lineTo(10f * s, 22f * s)
+                lineTo(19.5f * s, 10f * s)
+                lineTo(13f * s, 10f * s)
+                close()
+            }
+            // Sombra muy suave
+            drawPath(bolt, Color.Black.copy(alpha = 0.25f), style = Stroke(width = 3.2f * s, join = StrokeJoin.Round))
+            // Contorno del rayo
+            drawPath(bolt, tint, style = Stroke(width = 1.7f * s, join = StrokeJoin.Round))
+        }
+    }
+}
+
+private fun describeCameraResolutions(camera: Camera, imageCapture: ImageCapture): String {
+    fun mp(w: Int, h: Int) = "%.1f MP".format(w.toLong() * h / 1e6)
+    fun fmt(sizes: Array<Size>?): String =
+        sizes?.sortedByDescending { it.width.toLong() * it.height }
+            ?.take(6)
+            ?.joinToString("\n") { "  ${it.width}x${it.height}  ${mp(it.width, it.height)}" }
+            ?: "  (ninguna)"
+
+    val sb = StringBuilder()
+    val chosen = imageCapture.resolutionInfo?.resolution
+    sb.appendLine(
+        "CameraX eligió: " +
+            (chosen?.let { "${it.width}x${it.height}  ${mp(it.width, it.height)}" } ?: "(todavía no disponible)")
+    )
+    val info = Camera2CameraInfo.from(camera.cameraInfo)
+    sb.appendLine("Cámara id: ${info.cameraId}")
+    sb.appendLine("ZSL soportado: ${camera.cameraInfo.isZslSupported}")
+
+    val map = info.getCameraCharacteristic(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+    sb.appendLine("\nJPEG normales (los 6 más grandes):")
+    sb.appendLine(fmt(map?.getOutputSizes(ImageFormat.JPEG)))
+    sb.appendLine("\nJPEG de alta resolución (más lentos):")
+    sb.appendLine(fmt(map?.getHighResolutionOutputSizes(ImageFormat.JPEG)))
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        val max = info.getCameraCharacteristic(
+            CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION
+        )
+        sb.appendLine("\nModo resolución máxima (50 MP):")
+        sb.appendLine(fmt(max?.getOutputSizes(ImageFormat.JPEG)))
+    }
+    return sb.toString()
+}
+
+private fun describeAllCameras(provider: ProcessCameraProvider?): String {
+    if (provider == null) return "(sin proveedor de cámara)"
+    val sb = StringBuilder("Cámaras que Android le muestra a la app:\n")
+    provider.availableCameraInfos.forEach { info ->
+        val c2 = Camera2CameraInfo.from(info)
+        val facing = when (c2.getCameraCharacteristic(CameraCharacteristics.LENS_FACING)) {
+            CameraCharacteristics.LENS_FACING_BACK -> "trasera"
+            CameraCharacteristics.LENS_FACING_FRONT -> "frontal"
+            else -> "externa"
+        }
+        val focal = c2.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
+        val sensor = c2.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+        val pixels = c2.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
+        val fov = if (focal != null && sensor != null)
+            Math.toDegrees(2 * atan(sensor.width / (2.0 * focal))).roundToInt() else null
+        val zoom = info.zoomState.value
+        sb.appendLine("• id ${c2.cameraId}: $facing")
+        sb.appendLine("   lente ${focal ?: "?"} mm · campo de visión ${fov ?: "?"}°")
+        sb.appendLine("   sensor ${pixels?.width}x${pixels?.height}")
+        sb.appendLine("   zoom ${zoom?.minZoomRatio ?: "?"}x a ${zoom?.maxZoomRatio ?: "?"}x")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            try {
+                @Suppress("UNCHECKED_CAST")
+                val key = CameraCharacteristics::class.java.getField("LOGICAL_MULTI_CAMERA_PHYSICAL_IDS").get(null) as? CameraCharacteristics.Key<Set<String>>
+                if (key != null) {
+                    val phys = c2.getCameraCharacteristic(key)
+                    if (!phys.isNullOrEmpty()) sb.appendLine("   cámaras físicas: ${phys.joinToString()}")
+                }
+            } catch (_: Exception) {}
+        }
+    }
+    return sb.toString()
 }
 
