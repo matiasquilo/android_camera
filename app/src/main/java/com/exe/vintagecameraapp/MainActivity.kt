@@ -1,3 +1,5 @@
+@file:OptIn(androidx.camera.camera2.interop.ExperimentalCamera2Interop::class)
+
 package com.exe.vintagecameraapp
 
 import android.Manifest
@@ -49,6 +51,18 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CaptureRequest
+import androidx.activity.compose.BackHandler
+import androidx.camera.camera2.interop.Camera2CameraControl
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.CaptureRequestOptions
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
+import androidx.compose.animation.scaleIn
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.graphics.PathOperation
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.drawscope.scale
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ExperimentalZeroShutterLag
@@ -133,7 +147,6 @@ import kotlin.math.tan
 private const val TAG = "Vintage"
 private const val SAVE_QUALITY = 92      // casi no se nota y comprime más rápido
 private const val LOCK_EXPOSURE = true   // false = bloquea solo el enfoque
-private const val SHOW_HORIZON = true     // línea del nivel de horizonte sobre el visor
 private const val FAST_SHUTTER = true     // 30 fps fijos: limita la exposición a ~1/30 s (menos fotos movidas con poca luz)
 const val EXTRA_FROM_TILE = "from_tile"   // lo usa el tile de ajustes rápidos
 private const val VOLUME_SHUTTER = true  // los botones de volumen sacan la foto (evita el temblor de tocar la pantalla)
@@ -446,6 +459,23 @@ fun CameraPreviewScreen(
     var showDate by remember { mutableStateOf(prefs.getBoolean("show_date", true)) }
     var flashOn by remember { mutableStateOf(false) }
     val hasFlash = cameraObj?.cameraInfo?.hasFlashUnit() == true
+
+    // Opciones del menú (tres puntitos)
+    var showHorizon by remember { mutableStateOf(prefs.getBoolean("show_horizon", true)) }
+    var showGrid by remember { mutableStateOf(prefs.getBoolean("show_grid", true)) }
+    var nightMode by remember { mutableStateOf(false) }      // arranca apagado a propósito
+    var menuOpen by remember { mutableStateOf(false) }
+
+    // Modo noche: permite exposiciones más largas (hay que quedarse quieto).
+    // Se vuelve a aplicar al volver a la app, por si la cámara se reinició.
+    DisposableEffect(lifecycleOwner, cameraObj, nightMode) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) cameraObj?.let { applyNightMode(it, nightMode) }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     LaunchedEffect(status) {
         if (status != null) {
             delay(1400)
@@ -811,9 +841,9 @@ fun CameraPreviewScreen(
                     )
                 }
 
-                CameraGrid(Modifier.fillMaxSize())
+                if (showGrid) CameraGrid(Modifier.fillMaxSize())
 
-                if (SHOW_HORIZON) HorizonLevel(Modifier.align(Alignment.Center))
+                if (showHorizon) HorizonLevel(Modifier.align(Alignment.Center))
 
                 FocusIndicator(focusPoint, focusOk, focusLocked) {
                     focusPoint = null
@@ -838,10 +868,51 @@ fun CameraPreviewScreen(
                 ZoomIndicator(
                     zoom = zoomRatio,
                     modifier = Modifier
-                        .align(Alignment.TopEnd)
+                        .align(Alignment.TopStart)
                         .padding(12.dp)
                         .clip(RoundedCornerShape(50))
                         .clickable { cameraObj?.cameraControl?.setZoomRatio(1f) }   // toque = volver a 1.0x
+                )
+
+                if (nightMode) {
+                    MoonIndicator(
+                        Modifier
+                            .align(Alignment.TopCenter)
+                            .padding(top = 10.dp)
+                            .offset(x = 46.dp)
+                    )
+                }
+
+                OptionsMenu(
+                    expanded = menuOpen,
+                    onDismiss = { menuOpen = false },
+                    options = listOf(
+                        MenuOption("Horizonte", null, showHorizon) {
+                            showHorizon = !showHorizon
+                            prefs.edit().putBoolean("show_horizon", showHorizon).apply()
+                        },
+                        MenuOption("Cuadrícula", null, showGrid) {
+                            showGrid = !showGrid
+                            prefs.edit().putBoolean("show_grid", showGrid).apply()
+                        },
+                        MenuOption("Modo noche", "Exposición más larga: quedate quieto", nightMode) {
+                            if (!nightMode && cameraObj?.let { nightFpsRange(it) } == null) {
+                                status = "El modo noche no está disponible en este celular" to System.nanoTime()
+                            } else {
+                                nightMode = !nightMode
+                                status = (if (nightMode) "Modo noche activado: quedate quieto"
+                                          else "Modo noche desactivado") to System.nanoTime()
+                            }
+                        }
+                    ),
+                    modifier = Modifier.fillMaxSize()
+                )
+
+                MoreDotsButton(
+                    onClick = { menuOpen = !menuOpen },
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(top = 10.dp, end = 6.dp)
                 )
 
                 StatusPill(
@@ -1734,5 +1805,177 @@ private fun PillButton(
             fontWeight = FontWeight.Medium,
             letterSpacing = 0.8.sp
         )
+    }
+}
+
+// ============================================================
+// MENÚ DE OPCIONES (TRES PUNTITOS) Y MODO NOCHE
+// ============================================================
+
+/** Rango de fotogramas que permite exposiciones largas (el de menor mínimo), o null si el celular no tiene uno. */
+@OptIn(ExperimentalCamera2Interop::class)
+private fun nightFpsRange(camera: Camera): android.util.Range<Int>? {
+    val ranges = Camera2CameraInfo.from(camera.cameraInfo)
+        .getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+        ?: return null
+    return ranges.filter { it.upper >= 15 && it.lower < 24 }.minByOrNull { it.lower }
+}
+
+/** Prende o apaga el modo noche sin reiniciar la cámara. */
+@OptIn(ExperimentalCamera2Interop::class)
+private fun applyNightMode(camera: Camera, enabled: Boolean) {
+    val control = Camera2CameraControl.from(camera.cameraControl)
+    if (enabled) {
+        val range = nightFpsRange(camera) ?: return
+        control.setCaptureRequestOptions(
+            CaptureRequestOptions.Builder()
+                .setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
+                .build()
+        )
+    } else {
+        control.clearCaptureRequestOptions()   // vuelve a lo que decide CameraX (30 fps fijos)
+    }
+}
+
+/** Una fila del menú: título, descripción opcional y un interruptor. */
+class MenuOption(
+    val title: String,
+    val subtitle: String?,
+    val checked: Boolean,
+    val onToggle: () -> Unit
+)
+
+/** Los tres puntitos del menú: solo los puntos, sin círculo. */
+@Composable
+fun MoreDotsButton(onClick: () -> Unit, modifier: Modifier = Modifier) {
+    Box(
+        modifier
+            .size(44.dp)
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = onClick
+            )
+            .semantics { contentDescription = "Opciones" },
+        contentAlignment = Alignment.Center
+    ) {
+        Canvas(Modifier.size(width = 6.dp, height = 22.dp)) {
+            val r = 1.7.dp.toPx()
+            val x = size.width / 2f
+            listOf(0.1f, 0.5f, 0.9f).forEach { f ->
+                val center = Offset(x, size.height * f)
+                drawCircle(Color.Black.copy(alpha = 0.25f), r + 1.2.dp.toPx(), center)   // sombra suave
+                drawCircle(Color.White.copy(alpha = 0.7f), r, center)
+            }
+        }
+    }
+}
+
+/** Menú desplegable propio (oscuro, bordes redondeados). Tocar afuera o "atrás" lo cierra. */
+@Composable
+fun OptionsMenu(
+    expanded: Boolean,
+    options: List<MenuOption>,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    BackHandler(enabled = expanded) { onDismiss() }
+    Box(modifier) {
+        if (expanded) {
+            // Capa invisible: tocar fuera del menú lo cierra
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = onDismiss
+                    )
+            )
+        }
+        AnimatedVisibility(
+            visible = expanded,
+            enter = fadeIn(tween(120)) +
+                scaleIn(tween(120), initialScale = 0.92f, transformOrigin = TransformOrigin(1f, 0f)),
+            exit = fadeOut(tween(100)),
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(top = 52.dp, end = 12.dp)
+        ) {
+            val shape = RoundedCornerShape(18.dp)
+            Column(
+                Modifier
+                    .width(230.dp)
+                    .background(Color(0xFF17171A).copy(alpha = 0.96f), shape)
+                    .border(1.dp, Ui.hairline, shape)
+                    .padding(vertical = 6.dp)
+            ) {
+                options.forEach { MenuSwitchRow(it) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MenuSwitchRow(option: MenuOption) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clickable(onClick = option.onToggle)
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(option.title, color = Ui.text, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+            if (option.subtitle != null) {
+                Text(option.subtitle, color = Ui.muted, fontSize = 11.sp)
+            }
+        }
+        Spacer(Modifier.width(12.dp))
+        MiniSwitch(option.checked)
+    }
+}
+
+@Composable
+private fun MiniSwitch(checked: Boolean) {
+    val track by animateColorAsState(if (checked) Ui.amber else Ui.hairline, label = "switchTrack")
+    val thumbX by animateDpAsState(if (checked) 18.dp else 2.dp, tween(120), label = "switchThumb")
+    Box(
+        Modifier
+            .size(width = 38.dp, height = 22.dp)
+            .background(track, RoundedCornerShape(50))
+    ) {
+        Box(
+            Modifier
+                .offset(x = thumbX, y = 2.dp)
+                .size(18.dp)
+                .background(Ui.text, CircleShape)
+        )
+    }
+}
+
+/** Lunita del modo noche: solo el contorno, en ámbar, sin círculo. */
+@Composable
+fun MoonIndicator(modifier: Modifier = Modifier) {
+    val moon = remember {
+        Path.combine(
+            PathOperation.Difference,
+            Path().apply { addOval(Rect(3.5f, 3.5f, 20.5f, 20.5f)) },   // luna llena (centro 12,12)
+            Path().apply { addOval(Rect(9.4f, 1.4f, 23f, 15f)) }        // círculo que la "muerde"
+        )
+    }
+    Box(
+        modifier
+            .size(44.dp)
+            .semantics { contentDescription = "Modo noche activado" },
+        contentAlignment = Alignment.Center
+    ) {
+        Canvas(Modifier.size(22.dp)) {
+            val k = size.width / 24f
+            scale(k, k, pivot = Offset.Zero) {
+                drawPath(moon, Color.Black.copy(alpha = 0.25f), style = Stroke(width = 3.2f, join = StrokeJoin.Round))
+                drawPath(moon, Ui.amber, style = Stroke(width = 1.7f, join = StrokeJoin.Round))
+            }
+        }
     }
 }
