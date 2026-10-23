@@ -24,6 +24,21 @@ import android.provider.MediaStore
 import android.provider.Settings
 import android.util.Log
 import android.util.Size
+import android.util.Range
+import android.app.KeyguardManager
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import android.os.SystemClock
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.semantics.onClick as semanticsOnClick
+import kotlin.math.abs
+import kotlin.math.atan2
 import android.view.GestureDetector
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -64,7 +79,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -119,6 +133,9 @@ import kotlin.math.tan
 private const val TAG = "Vintage"
 private const val SAVE_QUALITY = 92      // casi no se nota y comprime más rápido
 private const val LOCK_EXPOSURE = true   // false = bloquea solo el enfoque
+private const val SHOW_HORIZON = true     // línea del nivel de horizonte sobre el visor
+private const val FAST_SHUTTER = true     // 30 fps fijos: limita la exposición a ~1/30 s (menos fotos movidas con poca luz)
+const val EXTRA_FROM_TILE = "from_tile"   // lo usa el tile de ajustes rápidos
 private const val VOLUME_SHUTTER = true  // los botones de volumen sacan la foto (evita el temblor de tocar la pantalla)
 
 private val DIGIT_SEGMENTS = mapOf(
@@ -283,6 +300,7 @@ class MainActivity : ComponentActivity() {
     @ExperimentalZeroShutterLag
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        applyLockScreenMode(intent)
 
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
@@ -331,6 +349,17 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    // Si se abre desde el tile de ajustes rápidos, puede mostrarse sobre la pantalla de bloqueo
+    private fun applyLockScreenMode(intent: Intent?) {
+        setShowWhenLocked(intent?.getBooleanExtra(EXTRA_FROM_TILE, false) == true)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        applyLockScreenMode(intent)
     }
 
     // El sensor de orientación solo funciona con la app a la vista (ahorra batería)
@@ -432,11 +461,17 @@ fun CameraPreviewScreen(
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
-                photoProcessingExecutor.execute {
-                    val last = loadLastPhoto(context)
-                    mainExecutor.execute {
-                        lastThumb = last?.first
-                        lastUri = last?.second
+                if (isDeviceLocked(context)) {
+                    // Con el celular bloqueado no se muestra la última foto
+                    lastThumb = null
+                    lastUri = null
+                } else {
+                    photoProcessingExecutor.execute {
+                        val last = loadLastPhoto(context)
+                        mainExecutor.execute {
+                            lastThumb = last?.first
+                            lastUri = last?.second
+                        }
                     }
                 }
             }
@@ -604,7 +639,7 @@ fun CameraPreviewScreen(
         if (capturing || cameraObj == null) return@takePhoto
         capturing = true
         flashTarget = 0.7f
-        vibrator.vibrate(VibrationEffect.createOneShot(20L, 60))
+        val pressNs = SystemClock.elapsedRealtimeNanos()
         val captureStartTime = System.nanoTime()
 
         processAndTakePhoto(
@@ -615,11 +650,18 @@ fun CameraPreviewScreen(
             captureExecutor = captureExecutor,
             photoProcessingExecutor = photoProcessingExecutor,
             captureStartTime = captureStartTime,
+            pressRealtimeNs = pressNs,
             processingCount = processingCount,
             drawDate = showDate,
-            onHandedOff = { mainExecutor.execute { capturing = false } },
+            // La vibración va DESPUÉS de capturar: así el motor no mueve el celular durante la toma
+            onHandedOff = {
+                mainExecutor.execute {
+                    capturing = false
+                    vibrator.vibrate(VibrationEffect.createOneShot(15L, 50))
+                }
+            },
             onResult = { resultMsg -> status = resultMsg to System.nanoTime() },
-            onSaved = { bmp, uri -> lastThumb = bmp; lastUri = uri }
+            onSaved = { bmp, uri -> if (!isDeviceLocked(context)) { lastThumb = bmp; lastUri = uri } }
         )
     }
 
@@ -720,6 +762,7 @@ fun CameraPreviewScreen(
                         )
 
                         val preview = Preview.Builder()
+                            .apply { if (FAST_SHUTTER) setTargetFrameRate(Range(30, 30)) }
                             .build()
                             .also {
                                 it.setSurfaceProvider(previewView.surfaceProvider)
@@ -770,6 +813,8 @@ fun CameraPreviewScreen(
                 }
 
                 CameraGrid(Modifier.fillMaxSize())
+
+                if (SHOW_HORIZON) HorizonLevel(Modifier.align(Alignment.Center))
 
                 FocusIndicator(focusPoint, focusOk, focusLocked) {
                     focusPoint = null
@@ -894,6 +939,7 @@ private fun processAndTakePhoto(
     captureExecutor: ExecutorService,
     photoProcessingExecutor: ExecutorService,
     captureStartTime: Long,
+    pressRealtimeNs: Long,
     processingCount: AtomicInteger,
     drawDate: Boolean = true,
     onHandedOff: () -> Unit,
@@ -907,6 +953,8 @@ private fun processAndTakePhoto(
         override fun onCaptureSuccess(image: ImageProxy) {
             val shutterMs = (System.nanoTime() - captureStartTime) / 1_000_000
             val captureDate = Date()
+            // Negativo = la foto salió de un cuadro anterior al toque (ZSL funcionando)
+            val frameOffsetMs = (image.imageInfo.timestamp - pressRealtimeNs) / 1_000_000
 
             val buffer = image.planes.firstOrNull()?.buffer
             if (buffer == null) {
@@ -975,7 +1023,7 @@ private fun processAndTakePhoto(
                     val totalMs = (System.nanoTime() - captureStartTime) / 1_000_000
                     Log.d(
                         TAG,
-                        "disparo=${shutterMs}ms cola=${waitMs}ms decod=$decodeMs rot=$rotateMs " +
+                        "disparo=${shutterMs}ms cuadro=${frameOffsetMs}ms cola=${waitMs}ms decod=$decodeMs rot=$rotateMs " +
                                 "fecha=$dateMs filtro=$lutMs guardar=$saveMs total=${totalMs}ms " +
                                 "(${"%.1f".format(megapixels)} MP)"
                     )
@@ -1168,6 +1216,9 @@ private fun loadLastPhoto(context: Context): Pair<Bitmap, Uri>? {
         null
     }
 }
+
+private fun isDeviceLocked(context: Context): Boolean =
+    (context.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager).isKeyguardLocked
 
 private fun openInGallery(context: Context, uri: Uri) {
     try {
@@ -1404,15 +1455,15 @@ fun ExposureControl(
     }
 }
 
-/** Botón de disparo: anillo + círculo interior que se achica al apretar. */
+/** Botón de disparo. Dispara al APOYAR el dedo (no al soltarlo): con ZSL la foto sale del cuadro anterior al toque. */
 @Composable
 fun ShutterButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     enabled: Boolean = true
 ) {
-    val interaction = remember { MutableInteractionSource() }
-    val pressed by interaction.collectIsPressedAsState()
+    var pressed by remember { mutableStateOf(false) }
+    val latestOnClick by rememberUpdatedState(onClick)
     val inner by animateDpAsState(
         targetValue = if (pressed) 52.dp else if (enabled) 62.dp else 46.dp,
         animationSpec = tween(90),
@@ -1423,15 +1474,95 @@ fun ShutterButton(
         modifier
             .size(80.dp)
             .border(3.dp, tone, CircleShape)
-            .clickable(
-                interactionSource = interaction,
-                indication = null,
-                enabled = enabled,
-                onClick = onClick
-            ),
+            .semantics(mergeDescendants = true) {
+                contentDescription = "Disparar"
+                semanticsOnClick { if (enabled) latestOnClick(); true }
+            }
+            .pointerInput(enabled) {
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false)
+                    pressed = true
+                    if (enabled) latestOnClick()
+                    waitForUpOrCancellation()
+                    pressed = false
+                }
+            },
         contentAlignment = Alignment.Center
     ) {
         Box(Modifier.size(inner).background(tone, CircleShape))
+    }
+}
+
+/** Nivel de horizonte: línea fina que sigue el horizonte real y se pone ámbar cuando está derecha. */
+@Composable
+fun HorizonLevel(modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var rel by remember { mutableFloatStateOf(0f) }      // desvío (grados) respecto del horizonte más cercano
+    var quarter by remember { mutableIntStateOf(0) }     // cuartos de vuelta del celular (0 = vertical)
+    var visible by remember { mutableStateOf(false) }
+
+    DisposableEffect(lifecycleOwner) {
+        val sm = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        val gravity = sm.getDefaultSensor(Sensor.TYPE_GRAVITY)
+        val sensor = gravity ?: sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        val needsFilter = gravity == null            // el acelerómetro crudo es ruidoso: se suaviza
+        var gx = 0f
+        var gy = 9.8f
+        var gz = 0f
+        val listener = object : SensorEventListener {
+            override fun onSensorChanged(e: SensorEvent) {
+                val k = if (needsFilter) 0.15f else 1f
+                gx += k * (e.values[0] - gx)
+                gy += k * (e.values[1] - gy)
+                gz += k * (e.values[2] - gz)
+                val angle = Math.toDegrees(atan2(gx.toDouble(), gy.toDouble()))
+                val q = Math.round(angle / 90.0).toInt()
+                val r = (angle - 90.0 * q).toFloat()
+                quarter = q
+                rel += 0.35f * (r - rel)
+                // Se oculta si el celular apunta muy arriba o abajo, o si está muy torcido a propósito
+                visible = abs(gz) < 7f && abs(rel) < 20f
+            }
+
+            override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+        }
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME ->
+                    sensor?.let { sm.registerListener(listener, it, SensorManager.SENSOR_DELAY_UI) }
+                Lifecycle.Event.ON_PAUSE -> sm.unregisterListener(listener)
+                else -> {}
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            sm.unregisterListener(listener)
+        }
+    }
+
+    val level = abs(rel) < 1f
+    val color by animateColorAsState(
+        if (level) Ui.amber else Color.White.copy(alpha = 0.6f), label = "horizonColor"
+    )
+    if (!visible) return
+
+    Canvas(modifier.size(240.dp)) {
+        val c = center
+        val stroke = 1.6.dp.toPx()
+        val half = 28.dp.toPx()
+        val gap = 100.dp.toPx()
+        val tick = 14.dp.toPx()
+        // Marcas fijas a los costados (la referencia)
+        rotate(degrees = 90f * quarter, pivot = c) {
+            drawLine(color, Offset(c.x - gap - tick, c.y), Offset(c.x - gap, c.y), stroke, StrokeCap.Round)
+            drawLine(color, Offset(c.x + gap, c.y), Offset(c.x + gap + tick, c.y), stroke, StrokeCap.Round)
+        }
+        // El horizonte real
+        rotate(degrees = 90f * quarter + rel, pivot = c) {
+            drawLine(color, Offset(c.x - half, c.y), Offset(c.x + half, c.y), stroke, StrokeCap.Round)
+        }
     }
 }
 
