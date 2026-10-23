@@ -843,7 +843,7 @@ fun CameraPreviewScreen(
 
                 if (showGrid) CameraGrid(Modifier.fillMaxSize())
 
-                if (showHorizon) HorizonLevel(Modifier.align(Alignment.Center))
+                if (showHorizon) HorizonLevel(Modifier.fillMaxSize())     // ahora ocupa todo el visor
 
                 FocusIndicator(focusPoint, focusOk, focusLocked) {
                     focusPoint = null
@@ -868,8 +868,8 @@ fun CameraPreviewScreen(
                 ZoomIndicator(
                     zoom = zoomRatio,
                     modifier = Modifier
-                        .align(Alignment.TopStart)
-                        .padding(12.dp)
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 14.dp)
                         .clip(RoundedCornerShape(50))
                         .clickable { cameraObj?.cameraControl?.setZoomRatio(1f) }   // toque = volver a 1.0x
                 )
@@ -919,7 +919,7 @@ fun CameraPreviewScreen(
                     message = status?.first,
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
-                        .padding(bottom = 14.dp)
+                        .padding(bottom = 58.dp)
                 )
 
                 if (flashAlpha > 0f) {
@@ -1563,7 +1563,7 @@ fun ShutterButton(
     }
 }
 
-/** Nivel de horizonte: línea fina que sigue el horizonte real y se pone ámbar cuando está derecha. */
+/** Nivel de horizonte: una sola barra que sigue el horizonte real. Derecha = ámbar y continua; torcida = gris y en tres tramos. */
 @Composable
 fun HorizonLevel(modifier: Modifier = Modifier) {
     val context = LocalContext.current
@@ -1571,6 +1571,7 @@ fun HorizonLevel(modifier: Modifier = Modifier) {
     var rel by remember { mutableFloatStateOf(0f) }      // desvío (grados) respecto del horizonte más cercano
     var quarter by remember { mutableIntStateOf(0) }     // cuartos de vuelta del celular (0 = vertical)
     var visible by remember { mutableStateOf(false) }
+    var level by remember { mutableStateOf(false) }      // ¿está derecho?
 
     DisposableEffect(lifecycleOwner) {
         val sm = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -1591,6 +1592,8 @@ fun HorizonLevel(modifier: Modifier = Modifier) {
                 val r = (angle - 90.0 * q).toFloat()
                 quarter = q
                 rel += 0.35f * (r - rel)
+                // Derecho a menos de 1°; una vez derecho, sigue "derecho" hasta 1,5° (evita que parpadee en el borde)
+                level = if (level) abs(rel) < 1.5f else abs(rel) < 1f
                 // Se oculta si el celular apunta muy arriba o abajo, o si está muy torcido a propósito
                 visible = abs(gz) < 7f && abs(rel) < 20f
             }
@@ -1612,26 +1615,40 @@ fun HorizonLevel(modifier: Modifier = Modifier) {
         }
     }
 
-    val level = abs(rel) < 1f
+    // Ajustes de aspecto
+    val lineThickness = 0.9.dp        // grosor de la línea (más chico = más fina)
+    val grayAlpha = 0.5f              // visibilidad cuando está torcida (más chico = más discreta)
     val color by animateColorAsState(
-        if (level) Ui.amber else Color.White.copy(alpha = 0.6f), label = "horizonColor"
+        if (level) Ui.amber.copy(alpha = 0.9f) else Color(0xFF9A968E).copy(alpha = grayAlpha),
+        label = "horizonColor"
     )
+    // Derecho: los tramos se tocan (separación 0) y forman una sola barra. Torcido: se separan.
+    val gap by animateDpAsState(if (level) 0.dp else 6.dp, tween(120), label = "horizonGap")
     if (!visible) return
 
-    Canvas(modifier.size(240.dp)) {
+    Canvas(modifier) {
         val c = center
-        val stroke = 1.6.dp.toPx()
-        val half = 28.dp.toPx()
-        val gap = 100.dp.toPx()
-        val tick = 14.dp.toPx()
-        // Marcas fijas a los costados (la referencia)
-        rotate(degrees = 90f * quarter, pivot = c) {
-            drawLine(color, Offset(c.x - gap - tick, c.y), Offset(c.x - gap, c.y), stroke, StrokeCap.Round)
-            drawLine(color, Offset(c.x + gap, c.y), Offset(c.x + gap + tick, c.y), stroke, StrokeCap.Round)
+        val stroke = lineThickness.toPx()
+        val half = kotlin.math.hypot(size.width, size.height) / 2f      // la diagonal: la línea llega de borde a borde aun girada
+        val centerHalf = 40.dp.toPx()           // el tramo del medio mide 80 dp
+        val g = gap.toPx()
+        val spans: List<Pair<Float, Float>> = if (g < 0.5f) {
+            listOf(Pair(-half, half))               // derecho: una sola barra de borde a borde
+        } else {
+            listOf(
+                Pair(-half, -centerHalf - g),
+                Pair(-centerHalf, centerHalf),
+                Pair(centerHalf + g, half)
+            )
         }
-        // El horizonte real
+        // Los tramos giran juntos con el horizonte (lo que sobra queda fuera del visor)
         rotate(degrees = 90f * quarter + rel, pivot = c) {
-            drawLine(color, Offset(c.x - half, c.y), Offset(c.x + half, c.y), stroke, StrokeCap.Round)
+            spans.forEach { (a, b) ->
+                drawLine(Color.Black.copy(alpha = 0.18f), Offset(c.x + a, c.y), Offset(c.x + b, c.y), stroke * 2.2f, StrokeCap.Round)
+            }
+            spans.forEach { (a, b) ->
+                drawLine(color, Offset(c.x + a, c.y), Offset(c.x + b, c.y), stroke, StrokeCap.Round)
+            }
         }
     }
 }
