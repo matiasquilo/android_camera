@@ -17,7 +17,7 @@
     <!-- 5. El flash no es obligatorio, pero lo declaramos para poder usarlo si existe -->
     <uses-feature android:name="android.hardware.camera.flash" android:required="false" />
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
         android:icon="@mipmap/ic_launcher"
@@ -29,6 +29,7 @@
             android:name=".MainActivity"
             android:exported="true"
             android:label="@string/app_name"
+            android:screenOrientation="portrait"
             android:theme="@style/Theme.VintageCameraApp"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
