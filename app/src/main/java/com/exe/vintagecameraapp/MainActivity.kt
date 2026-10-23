@@ -747,10 +747,9 @@ fun CameraPreviewScreen(
                                     val lockFlags = if (LOCK_EXPOSURE) FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE
                                                     else FocusMeteringAction.FLAG_AF
                                     val action = FocusMeteringAction.Builder(
-                                        point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE
+                                        point, lockFlags
                                     )
                                         .disableAutoCancel()
-                                        .setLockingMode(lockFlags)
                                         .build()
                                     val future = cameraObj?.cameraControl?.startFocusAndMetering(action)
                                     future?.addListener({
