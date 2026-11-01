@@ -1,5 +1,3 @@
-@file:OptIn(androidx.camera.camera2.interop.ExperimentalCamera2Interop::class)
-
 package com.exe.vintagecameraapp
 
 import android.Manifest
@@ -15,34 +13,19 @@ import android.graphics.Canvas
 import android.graphics.Color as AndroidColor
 import android.graphics.Matrix
 import android.graphics.Paint
+import android.media.ExifInterface
 import android.media.ThumbnailUtils
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import android.provider.MediaStore
-import android.provider.Settings
 import android.util.Log
 import android.util.Size
-import android.util.Range
-import android.app.KeyguardManager
-import android.hardware.Sensor
-import android.hardware.SensorEvent
-import android.hardware.SensorEventListener
-import android.hardware.SensorManager
-import android.os.SystemClock
-import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.waitForUpOrCancellation
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.graphics.drawscope.rotate
-import androidx.compose.ui.semantics.onClick as semanticsOnClick
-import kotlin.math.abs
-import kotlin.math.atan2
 import android.view.GestureDetector
-import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.OrientationEventListener
 import android.view.ScaleGestureDetector
@@ -51,18 +34,6 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CaptureRequest
-import androidx.activity.compose.BackHandler
-import androidx.camera.camera2.interop.Camera2CameraControl
-import androidx.camera.camera2.interop.Camera2CameraInfo
-import androidx.camera.camera2.interop.CaptureRequestOptions
-import androidx.camera.camera2.interop.ExperimentalCamera2Interop
-import androidx.compose.animation.scaleIn
-import androidx.compose.ui.geometry.Rect
-import androidx.compose.ui.graphics.PathOperation
-import androidx.compose.ui.graphics.TransformOrigin
-import androidx.compose.ui.graphics.drawscope.scale
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ExperimentalZeroShutterLag
@@ -93,6 +64,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -103,12 +75,21 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
+import android.graphics.ImageFormat
+import android.hardware.camera2.CameraCharacteristics
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
@@ -132,6 +113,7 @@ import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.io.BufferedOutputStream
+import java.io.ByteArrayInputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -141,15 +123,14 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
+import kotlin.math.atan
 import kotlin.math.roundToInt
 import kotlin.math.tan
 
 private const val TAG = "Vintage"
 private const val SAVE_QUALITY = 92      // casi no se nota y comprime más rápido
+private const val HIGH_RES = false       // true = 12,5 MP (4080x3072), probablemente más lento
 private const val LOCK_EXPOSURE = true   // false = bloquea solo el enfoque
-private const val FAST_SHUTTER = true     // 30 fps fijos: limita la exposición a ~1/30 s (menos fotos movidas con poca luz)
-const val EXTRA_FROM_TILE = "from_tile"   // lo usa el tile de ajustes rápidos
-private const val VOLUME_SHUTTER = true  // los botones de volumen sacan la foto (evita el temblor de tocar la pantalla)
 
 private val DIGIT_SEGMENTS = mapOf(
     '0' to "abcdef", '1' to "bc",     '2' to "abged", '3' to "abgcd", '4' to "fgbc",
@@ -297,23 +278,11 @@ class MainActivity : ComponentActivity() {
 
     private var hasCameraPermission by mutableStateOf(false)
     private var deviceRotation by mutableIntStateOf(0)
-    private var shutterSignal by mutableIntStateOf(0)
     private lateinit var orientationEventListener: OrientationEventListener
-
-    private val cameraPermissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            hasCameraPermission = granted
-        }
-
-    private fun hasPermissionNow() = ContextCompat.checkSelfPermission(
-        this,
-        Manifest.permission.CAMERA
-    ) == PackageManager.PERMISSION_GRANTED
 
     @ExperimentalZeroShutterLag
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        applyLockScreenMode(intent)
 
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
@@ -331,9 +300,19 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        hasCameraPermission = hasPermissionNow()
+        orientationEventListener.enable()
+
+        hasCameraPermission = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.CAMERA
+        ) == PackageManager.PERMISSION_GRANTED
+
         if (!hasCameraPermission) {
-            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+            registerForActivityResult(
+                ActivityResultContracts.RequestPermission()
+            ) {
+                hasCameraPermission = it
+            }.launch(Manifest.permission.CAMERA)
         }
 
         setContent {
@@ -344,65 +323,16 @@ class MainActivity : ComponentActivity() {
                 if (hasCameraPermission) {
                     CameraPreviewScreen(
                         modifier = Modifier.fillMaxSize(),
-                        deviceRotation = deviceRotation,
-                        shutterSignal = shutterSignal
-                    )
-                } else {
-                    PermissionScreen(
-                        onRequest = { cameraPermissionLauncher.launch(Manifest.permission.CAMERA) },
-                        onOpenSettings = {
-                            startActivity(
-                                Intent(
-                                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                                    Uri.fromParts("package", packageName, null)
-                                )
-                            )
-                        }
+                        deviceRotation = deviceRotation
                     )
                 }
             }
         }
     }
 
-    // Si se abre desde el tile de ajustes rápidos, puede mostrarse sobre la pantalla de bloqueo
-    private fun applyLockScreenMode(intent: Intent?) {
-        setShowWhenLocked(intent?.getBooleanExtra(EXTRA_FROM_TILE, false) == true)
-    }
-
-    override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent)
-        setIntent(intent)
-        applyLockScreenMode(intent)
-    }
-
-    // El sensor de orientación solo funciona con la app a la vista (ahorra batería)
-    override fun onResume() {
-        super.onResume()
-        orientationEventListener.enable()
-        hasCameraPermission = hasPermissionNow()   // por si diste el permiso desde los ajustes
-    }
-
-    override fun onPause() {
+    override fun onDestroy() {
+        super.onDestroy()
         orientationEventListener.disable()
-        super.onPause()
-    }
-
-    // Botones de volumen = disparador
-    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        if (VOLUME_SHUTTER && hasCameraPermission &&
-            (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN)
-        ) {
-            if (event?.repeatCount == 0) shutterSignal++
-            return true
-        }
-        return super.onKeyDown(keyCode, event)
-    }
-
-    override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
-        if (VOLUME_SHUTTER && hasCameraPermission &&
-            (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN)
-        ) return true
-        return super.onKeyUp(keyCode, event)
     }
 }
 
@@ -414,8 +344,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun CameraPreviewScreen(
     modifier: Modifier = Modifier,
-    deviceRotation: Int,
-    shutterSignal: Int = 0
+    deviceRotation: Int
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -459,23 +388,23 @@ fun CameraPreviewScreen(
     var showDate by remember { mutableStateOf(prefs.getBoolean("show_date", true)) }
     var flashOn by remember { mutableStateOf(false) }
     val hasFlash = cameraObj?.cameraInfo?.hasFlashUnit() == true
+    var debugInfo by remember { mutableStateOf<String?>(null) }
 
-    // Opciones del menú (tres puntitos)
-    var showHorizon by remember { mutableStateOf(prefs.getBoolean("show_horizon", true)) }
-    var showGrid by remember { mutableStateOf(prefs.getBoolean("show_grid", true)) }
-    var nightMode by remember { mutableStateOf(false) }      // arranca apagado a propósito
-    var menuOpen by remember { mutableStateOf(false) }
-
-    // Modo noche: permite exposiciones más largas (hay que quedarse quieto).
-    // Se vuelve a aplicar al volver a la app, por si la cámara se reinició.
-    DisposableEffect(lifecycleOwner, cameraObj, nightMode) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) cameraObj?.let { applyNightMode(it, nightMode) }
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    debugInfo?.let { text ->
+        AlertDialog(
+            onDismissRequest = { debugInfo = null },
+            confirmButton = { TextButton(onClick = { debugInfo = null }) { Text("Cerrar") } },
+            title = { Text("Resoluciones de la cámara") },
+            text = {
+                Text(
+                    text,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 12.sp,
+                    modifier = Modifier.verticalScroll(rememberScrollState())
+                )
+            }
+        )
     }
-
     LaunchedEffect(status) {
         if (status != null) {
             delay(1400)
@@ -491,17 +420,11 @@ fun CameraPreviewScreen(
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
-                if (isDeviceLocked(context)) {
-                    // Con el celular bloqueado no se muestra la última foto
-                    lastThumb = null
-                    lastUri = null
-                } else {
-                    photoProcessingExecutor.execute {
-                        val last = loadLastPhoto(context)
-                        mainExecutor.execute {
-                            lastThumb = last?.first
-                            lastUri = last?.second
-                        }
+                photoProcessingExecutor.execute {
+                    val last = loadLastPhoto(context)
+                    mainExecutor.execute {
+                        lastThumb = last?.first
+                        lastUri = last?.second
                     }
                 }
             }
@@ -533,63 +456,6 @@ fun CameraPreviewScreen(
         selectedLutReference.set(selectedLut)
     }
 
-    // Análisis de cuadros para la vista previa con filtro.
-    // Solo corre cuando hay un filtro elegido: en STD se apaga (menos CPU y menos batería).
-    val analysisSelector = ResolutionSelector.Builder()
-        .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
-        .setResolutionStrategy(
-            ResolutionStrategy(
-                Size(640, 480),
-                ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
-            )
-        )
-        .build()
-
-    val imageAnalysis = remember {
-        ImageAnalysis.Builder()
-            .setResolutionSelector(analysisSelector)
-            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-            .build()
-    }
-
-    val frameAnalyzer = remember {
-        var lastFrameTime = 0L
-        ImageAnalysis.Analyzer { image ->
-            try {
-                val now = System.nanoTime()
-                val minGap = if (processingCount.get() > 0) 100_000_000L else 33_000_000L
-                if (now - lastFrameTime < minGap) return@Analyzer
-                lastFrameTime = now
-
-                val preset = selectedPresetReference.get()
-                val lut = selectedLutReference.get()
-
-                if (preset != VintagePreset.NORMAL && lut != null) {
-                    val filtered = previewProcessor.process(image, lut)
-                    overlayShown.set(true)
-                    mainExecutor.execute { previewBitmap = filtered }
-                } else if (overlayShown.getAndSet(false)) {
-                    mainExecutor.execute { previewBitmap = null }
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "analyzer", e)
-            } finally {
-                image.close()
-            }
-        }
-    }
-
-    LaunchedEffect(selectedPreset) {
-        if (selectedPreset == VintagePreset.NORMAL) {
-            imageAnalysis.clearAnalyzer()
-            overlayShown.set(false)
-            previewBitmap = null
-        } else {
-            imageAnalysis.setAnalyzer(analysisExecutor, frameAnalyzer)
-        }
-    }
-
     // Camera Provider
     val cameraProviderState = produceState<ProcessCameraProvider?>(
         initialValue = null
@@ -612,15 +478,18 @@ fun CameraPreviewScreen(
         }
     }
 
-    // Captura con ZSL, a 8 MP (3264x2448), la mayor foto 4:3 normal del celular
+    // Image Capture with ZSL and max 12MP ResolutionSelector
     val captureSelector = ResolutionSelector.Builder()
         .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
         .setResolutionStrategy(
             ResolutionStrategy(
-                Size(3264, 2448),
+                if (HIGH_RES) Size(4080, 3072) else Size(3264, 2448),
                 ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER
             )
         )
+        .apply {
+            if (HIGH_RES) setAllowedResolutionMode(ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE)
+        }
         .build()
 
     val imageCapture = remember {
@@ -653,63 +522,11 @@ fun CameraPreviewScreen(
         }
     }
 
-    // Vibración corta al disparar
-    val vibrator = remember {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val vibratorManager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
-            vibratorManager.defaultVibrator
-        } else {
-            @Suppress("DEPRECATION")
-            context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
-        }
-    }
-
-    // Disparo (lo usan el botón y los botones de volumen)
-    val takePhoto: () -> Unit = takePhoto@{
-        if (capturing || cameraObj == null) return@takePhoto
-        capturing = true
-        flashTarget = 0.7f
-        val pressNs = SystemClock.elapsedRealtimeNanos()
-        val captureStartTime = System.nanoTime()
-
-        processAndTakePhoto(
-            context = context,
-            imageCapture = imageCapture,
-            preset = selectedPreset,
-            lut = selectedLut,
-            captureExecutor = captureExecutor,
-            photoProcessingExecutor = photoProcessingExecutor,
-            captureStartTime = captureStartTime,
-            pressRealtimeNs = pressNs,
-            processingCount = processingCount,
-            drawDate = showDate,
-            // La vibración va DESPUÉS de capturar: así el motor no mueve el celular durante la toma
-            onHandedOff = {
-                mainExecutor.execute {
-                    capturing = false
-                    vibrator.vibrate(VibrationEffect.createOneShot(15L, 50))
-                }
-            },
-            onResult = { resultMsg -> status = resultMsg to System.nanoTime() },
-            onSaved = { bmp, uri -> if (!isDeviceLocked(context)) { lastThumb = bmp; lastUri = uri } }
-        )
-    }
-
-    val currentTakePhoto by rememberUpdatedState(takePhoto)
-    var handledSignal by remember { mutableIntStateOf(shutterSignal) }
-    LaunchedEffect(shutterSignal) {
-        if (shutterSignal != handledSignal) {
-            handledSignal = shutterSignal
-            currentTakePhoto()
-        }
-    }
-
     // UI
     Column(
         modifier = modifier
             .background(Ui.bg)
-            .statusBarsPadding()
-            .navigationBarsPadding(),
+            .statusBarsPadding(),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Spacer(Modifier.height(12.dp))
@@ -736,9 +553,8 @@ fun CameraPreviewScreen(
                             ctx,
                             object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
                                 override fun onScale(detector: ScaleGestureDetector): Boolean {
-                                    val zs = cameraObj?.cameraInfo?.zoomState?.value ?: return true
-                                    val target = (zs.zoomRatio * detector.scaleFactor).coerceIn(zs.minZoomRatio, zs.maxZoomRatio)
-                                    cameraObj?.cameraControl?.setZoomRatio(target)
+                                    val current = cameraObj?.cameraInfo?.zoomState?.value?.zoomRatio ?: 1f
+                                    cameraObj?.cameraControl?.setZoomRatio(current * detector.scaleFactor)
                                     return true
                                 }
                             }
@@ -749,9 +565,7 @@ fun CameraPreviewScreen(
                             object : GestureDetector.SimpleOnGestureListener() {
                                 @SuppressLint("ClickableViewAccessibility")
                                 override fun onSingleTapUp(e: MotionEvent): Boolean {
-                                    val wasLocked = focusLocked
                                     focusLocked = false
-                                    if (wasLocked) cameraObj?.cameraControl?.cancelFocusAndMetering()
                                     val point = previewView.meteringPointFactory.createPoint(e.x, e.y)
                                     focusPoint = Offset(e.x, e.y)
                                     focusOk = null
@@ -769,16 +583,13 @@ fun CameraPreviewScreen(
                                 }
 
                                 override fun onLongPress(e: MotionEvent) {
-                                    previewView.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
                                     val point = previewView.meteringPointFactory.createPoint(e.x, e.y)
                                     focusPoint = Offset(e.x, e.y)
                                     focusLocked = true
                                     focusOk = null
-                                    val lockFlags = if (LOCK_EXPOSURE) FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE
-                                                    else FocusMeteringAction.FLAG_AF
-                                    val action = FocusMeteringAction.Builder(
-                                        point, lockFlags
-                                    )
+                                    val flags = if (LOCK_EXPOSURE) FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE
+                                                else FocusMeteringAction.FLAG_AF
+                                    val action = FocusMeteringAction.Builder(point, flags)
                                         .disableAutoCancel()
                                         .build()
                                     val future = cameraObj?.cameraControl?.startFocusAndMetering(action)
@@ -791,7 +602,6 @@ fun CameraPreviewScreen(
                         )
 
                         val preview = Preview.Builder()
-                            .apply { if (FAST_SHUTTER) setTargetFrameRate(Range(30, 30)) }
                             .build()
                             .also {
                                 it.setSurfaceProvider(previewView.surfaceProvider)
@@ -803,6 +613,47 @@ fun CameraPreviewScreen(
                                 gestureDetector.onTouchEvent(event)
                             }
                             true
+                        }
+
+                        val analysisSelector = ResolutionSelector.Builder()
+                            .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                            .setResolutionStrategy(
+                                ResolutionStrategy(
+                                    Size(640, 480),
+                                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                                )
+                            )
+                            .build()
+
+                        val imageAnalysis = ImageAnalysis.Builder()
+                            .setResolutionSelector(analysisSelector)
+                            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                            .build()
+
+                        var lastFrameTime = 0L
+                        imageAnalysis.setAnalyzer(analysisExecutor) { image ->
+                            try {
+                                val now = System.nanoTime()
+                                val minGap = if (processingCount.get() > 0) 100_000_000L else 33_000_000L
+                                if (now - lastFrameTime < minGap) return@setAnalyzer
+                                lastFrameTime = now
+
+                                val preset = selectedPresetReference.get()
+                                val lut = selectedLutReference.get()
+
+                                if (preset != VintagePreset.NORMAL && lut != null) {
+                                    val filtered = previewProcessor.process(image, lut)
+                                    overlayShown.set(true)
+                                    mainExecutor.execute { previewBitmap = filtered }
+                                } else if (overlayShown.getAndSet(false)) {
+                                    mainExecutor.execute { previewBitmap = null }
+                                }
+                            } catch (e: Exception) {
+                                Log.e(TAG, "analyzer", e)
+                            } finally {
+                                image.close()
+                            }
                         }
 
                         try {
@@ -841,9 +692,7 @@ fun CameraPreviewScreen(
                     )
                 }
 
-                if (showGrid) CameraGrid(Modifier.fillMaxSize())
-
-                if (showHorizon) HorizonLevel(Modifier.fillMaxSize())     // ahora ocupa todo el visor
+                CameraGrid(Modifier.fillMaxSize())
 
                 FocusIndicator(focusPoint, focusOk, focusLocked) {
                     focusPoint = null
@@ -868,58 +717,23 @@ fun CameraPreviewScreen(
                 ZoomIndicator(
                     zoom = zoomRatio,
                     modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(bottom = 14.dp)
-                        .clip(RoundedCornerShape(50))
-                        .clickable { cameraObj?.cameraControl?.setZoomRatio(1f) }   // toque = volver a 1.0x
-                )
-
-                if (nightMode) {
-                    MoonIndicator(
-                        Modifier
-                            .align(Alignment.TopCenter)
-                            .padding(top = 10.dp)
-                            .offset(x = 46.dp)
-                    )
-                }
-
-                OptionsMenu(
-                    expanded = menuOpen,
-                    onDismiss = { menuOpen = false },
-                    options = listOf(
-                        MenuOption("Horizonte", null, showHorizon) {
-                            showHorizon = !showHorizon
-                            prefs.edit().putBoolean("show_horizon", showHorizon).apply()
-                        },
-                        MenuOption("Cuadrícula", null, showGrid) {
-                            showGrid = !showGrid
-                            prefs.edit().putBoolean("show_grid", showGrid).apply()
-                        },
-                        MenuOption("Modo noche", "Exposición más larga: quedate quieto", nightMode) {
-                            if (!nightMode && cameraObj?.let { nightFpsRange(it) } == null) {
-                                status = "El modo noche no está disponible en este celular" to System.nanoTime()
-                            } else {
-                                nightMode = !nightMode
-                                status = (if (nightMode) "Modo noche activado: quedate quieto"
-                                          else "Modo noche desactivado") to System.nanoTime()
-                            }
-                        }
-                    ),
-                    modifier = Modifier.fillMaxSize()
-                )
-
-                MoreDotsButton(
-                    onClick = { menuOpen = !menuOpen },
-                    modifier = Modifier
                         .align(Alignment.TopEnd)
-                        .padding(top = 10.dp, end = 6.dp)
+                        .padding(12.dp)
+                        .pointerInput(Unit) {
+                            detectTapGestures(onLongPress = {
+                                cameraObj?.let {
+                                    debugInfo = describeCameraResolutions(it, imageCapture) + "\n\n" +
+                                        describeAllCameras(cameraProviderState.value)
+                                }
+                            })
+                        }
                 )
 
                 StatusPill(
                     message = status?.first,
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
-                        .padding(bottom = 58.dp)
+                        .padding(bottom = 14.dp)
                 )
 
                 if (flashAlpha > 0f) {
@@ -970,7 +784,7 @@ fun CameraPreviewScreen(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 28.dp)
-                .padding(bottom = 12.dp),
+                .padding(bottom = 28.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Box(Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
@@ -981,7 +795,43 @@ fun CameraPreviewScreen(
             }
             ShutterButton(
                 enabled = !capturing,
-                onClick = takePhoto
+                onClick = {
+                    capturing = true
+                    flashTarget = 0.7f
+
+                    val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        val vibratorManager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
+                        vibratorManager.defaultVibrator
+                    } else {
+                        @Suppress("DEPRECATION")
+                        context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                    }
+
+                    vibrator.vibrate(
+                        VibrationEffect.createOneShot(
+                            20L,
+                            60
+                        )
+                    )
+                    val tapRealtimeNs = SystemClock.elapsedRealtimeNanos()
+                    val captureStartTime = System.nanoTime()
+
+                    processAndTakePhoto(
+                        context = context,
+                        imageCapture = imageCapture,
+                        preset = selectedPreset,
+                        lut = selectedLut,
+                        captureExecutor = captureExecutor,
+                        photoProcessingExecutor = photoProcessingExecutor,
+                        captureStartTime = captureStartTime,
+                        tapRealtimeNs = tapRealtimeNs,
+                        processingCount = processingCount,
+                        drawDate = showDate,
+                        onHandedOff = { mainExecutor.execute { capturing = false } },
+                        onResult = { resultMsg -> status = resultMsg to System.nanoTime() },
+                        onSaved = { bmp, uri -> lastThumb = bmp; lastUri = uri }
+                    )
+                }
             )
             Box(Modifier.weight(1f), contentAlignment = Alignment.CenterEnd) {
                 DateToggle(
@@ -1009,7 +859,7 @@ private fun processAndTakePhoto(
     captureExecutor: ExecutorService,
     photoProcessingExecutor: ExecutorService,
     captureStartTime: Long,
-    pressRealtimeNs: Long,
+    tapRealtimeNs: Long,
     processingCount: AtomicInteger,
     drawDate: Boolean = true,
     onHandedOff: () -> Unit,
@@ -1023,8 +873,8 @@ private fun processAndTakePhoto(
         override fun onCaptureSuccess(image: ImageProxy) {
             val shutterMs = (System.nanoTime() - captureStartTime) / 1_000_000
             val captureDate = Date()
-            // Negativo = la foto salió de un cuadro anterior al toque (ZSL funcionando)
-            val frameOffsetMs = (image.imageInfo.timestamp - pressRealtimeNs) / 1_000_000
+            val frameTimestampNs = image.imageInfo.timestamp
+            val frameOffsetMs = (frameTimestampNs - tapRealtimeNs) / 1_000_000
 
             val buffer = image.planes.firstOrNull()?.buffer
             if (buffer == null) {
@@ -1051,6 +901,14 @@ private fun processAndTakePhoto(
                     return d
                 }
 
+                val expInfo = try {
+                    val exif = ExifInterface(ByteArrayInputStream(jpegBytes))
+                    val exp = exif.getAttribute(ExifInterface.TAG_EXPOSURE_TIME)?.toDoubleOrNull()
+                    val iso = exif.getAttribute(ExifInterface.TAG_ISO_SPEED_RATINGS)
+                    val expTxt = if (exp != null && exp > 0 && exp < 1) "1/${Math.round(1.0 / exp)} s" else "${exp ?: "?"} s"
+                    "exp $expTxt · ISO ${iso ?: "?"}"
+                } catch (e: Exception) { "exp ?" }
+
                 try {
                     val opts = BitmapFactory.Options().apply {
                         inMutable = true
@@ -1058,7 +916,9 @@ private fun processAndTakePhoto(
                     }
                     var bitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size, opts)
                     if (bitmap == null) {
-                        mainExecutor.execute { onResult("No se pudo procesar la imagen") }
+                        mainExecutor.execute {
+                            onResult("No se pudo procesar la imagen")
+                        }
                         return@execute
                     }
                     val megapixels = bitmap.width * bitmap.height / 1_000_000f
@@ -1084,7 +944,7 @@ private fun processAndTakePhoto(
                     if (preset != VintagePreset.NORMAL && lut != null) lut.applyInPlace(bitmap)
                     val lutMs = lap()
 
-                    val uri = saveBitmapToGallery(context, bitmap, SAVE_QUALITY, captureDate.time)
+                    val uri = saveBitmapToGallery(context, bitmap, SAVE_QUALITY)
                     val ok = uri != null
                     val saveMs = lap()
                     val thumb = if (ok) ThumbnailUtils.extractThumbnail(bitmap, 192, 192) else null
@@ -1093,9 +953,9 @@ private fun processAndTakePhoto(
                     val totalMs = (System.nanoTime() - captureStartTime) / 1_000_000
                     Log.d(
                         TAG,
-                        "disparo=${shutterMs}ms cuadro=${frameOffsetMs}ms cola=${waitMs}ms decod=$decodeMs rot=$rotateMs " +
+                        "disparo=${shutterMs}ms cola=${waitMs}ms decod=$decodeMs rot=$rotateMs " +
                                 "fecha=$dateMs filtro=$lutMs guardar=$saveMs total=${totalMs}ms " +
-                                "(${"%.1f".format(megapixels)} MP)"
+                                "(${"%.1f".format(megapixels)} MP) frame vs toque ${if (frameOffsetMs >= 0) "+" else ""}$frameOffsetMs ms · $expInfo"
                     )
                     mainExecutor.execute {
                         onResult(if (ok) "Foto guardada" else "No se pudo guardar la foto")
@@ -1103,10 +963,14 @@ private fun processAndTakePhoto(
                     }
                 } catch (e: OutOfMemoryError) {
                     Log.e(TAG, "sin memoria", e)
-                    mainExecutor.execute { onResult("Sin memoria para procesar la foto") }
+                    mainExecutor.execute {
+                        onResult("Sin memoria para procesar la foto")
+                    }
                 } catch (e: Exception) {
                     Log.e(TAG, "procesando foto", e)
-                    mainExecutor.execute { onResult("Error al procesar la foto") }
+                    mainExecutor.execute {
+                        onResult("Error al procesar la foto")
+                    }
                 } finally {
                     processingCount.decrementAndGet()
                 }
@@ -1116,7 +980,9 @@ private fun processAndTakePhoto(
         override fun onError(exception: ImageCaptureException) {
             Log.e(TAG, "captura", exception)
             onHandedOff()
-            mainExecutor.execute { onResult("Error al tomar la foto") }
+            mainExecutor.execute {
+                onResult("Error al tomar la foto")
+            }
         }
     })
 }
@@ -1218,12 +1084,11 @@ private fun drawSegmentDate(
 // SAVE TO GALLERY
 // ============================================================
 
-private fun saveBitmapToGallery(context: Context, bitmap: Bitmap, quality: Int, takenAtMs: Long): Uri? {
+private fun saveBitmapToGallery(context: Context, bitmap: Bitmap, quality: Int): Uri? {
     val resolver = context.contentResolver
     val values = ContentValues().apply {
-        put(MediaStore.MediaColumns.DISPLAY_NAME, "Vintage_$takenAtMs.jpg")
+        put(MediaStore.MediaColumns.DISPLAY_NAME, "Vintage_${System.currentTimeMillis()}.jpg")
         put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-        put(MediaStore.Images.Media.DATE_TAKEN, takenAtMs)   // la galería ordena por cuándo sacaste la foto
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/VintageCamera")
             put(MediaStore.Images.Media.IS_PENDING, 1)
@@ -1286,9 +1151,6 @@ private fun loadLastPhoto(context: Context): Pair<Bitmap, Uri>? {
         null
     }
 }
-
-private fun isDeviceLocked(context: Context): Boolean =
-    (context.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager).isKeyguardLocked
 
 private fun openInGallery(context: Context, uri: Uri) {
     try {
@@ -1525,15 +1387,15 @@ fun ExposureControl(
     }
 }
 
-/** Botón de disparo. Dispara al APOYAR el dedo (no al soltarlo): con ZSL la foto sale del cuadro anterior al toque. */
+/** Botón de disparo: anillo + círculo interior que se achica al apretar. */
 @Composable
 fun ShutterButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     enabled: Boolean = true
 ) {
-    var pressed by remember { mutableStateOf(false) }
-    val latestOnClick by rememberUpdatedState(onClick)
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
     val inner by animateDpAsState(
         targetValue = if (pressed) 52.dp else if (enabled) 62.dp else 46.dp,
         animationSpec = tween(90),
@@ -1544,112 +1406,15 @@ fun ShutterButton(
         modifier
             .size(80.dp)
             .border(3.dp, tone, CircleShape)
-            .semantics(mergeDescendants = true) {
-                contentDescription = "Disparar"
-                semanticsOnClick { if (enabled) latestOnClick(); true }
-            }
-            .pointerInput(enabled) {
-                awaitEachGesture {
-                    awaitFirstDown(requireUnconsumed = false)
-                    pressed = true
-                    if (enabled) latestOnClick()
-                    waitForUpOrCancellation()
-                    pressed = false
-                }
-            },
+            .clickable(
+                interactionSource = interaction,
+                indication = null,
+                enabled = enabled,
+                onClick = onClick
+            ),
         contentAlignment = Alignment.Center
     ) {
         Box(Modifier.size(inner).background(tone, CircleShape))
-    }
-}
-
-/** Nivel de horizonte: una sola barra que sigue el horizonte real. Derecha = ámbar y continua; torcida = gris y en tres tramos. */
-@Composable
-fun HorizonLevel(modifier: Modifier = Modifier) {
-    val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
-    var rel by remember { mutableFloatStateOf(0f) }      // desvío (grados) respecto del horizonte más cercano
-    var quarter by remember { mutableIntStateOf(0) }     // cuartos de vuelta del celular (0 = vertical)
-    var visible by remember { mutableStateOf(false) }
-    var level by remember { mutableStateOf(false) }      // ¿está derecho?
-
-    DisposableEffect(lifecycleOwner) {
-        val sm = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
-        val gravity = sm.getDefaultSensor(Sensor.TYPE_GRAVITY)
-        val sensor = gravity ?: sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-        val needsFilter = gravity == null            // el acelerómetro crudo es ruidoso: se suaviza
-        var gx = 0f
-        var gy = 9.8f
-        var gz = 0f
-        val listener = object : SensorEventListener {
-            override fun onSensorChanged(e: SensorEvent) {
-                val k = if (needsFilter) 0.15f else 1f
-                gx += k * (e.values[0] - gx)
-                gy += k * (e.values[1] - gy)
-                gz += k * (e.values[2] - gz)
-                val angle = Math.toDegrees(atan2(gx.toDouble(), gy.toDouble()))
-                val q = Math.round(angle / 90.0).toInt()
-                val r = (angle - 90.0 * q).toFloat()
-                quarter = q
-                rel += 0.35f * (r - rel)
-                // Derecho a menos de 1°; una vez derecho, sigue "derecho" hasta 1,5° (evita que parpadee en el borde)
-                level = if (level) abs(rel) < 1.5f else abs(rel) < 1f
-                // Se oculta si el celular apunta muy arriba o abajo, o si está muy torcido a propósito
-                visible = abs(gz) < 7f && abs(rel) < 20f
-            }
-
-            override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
-        }
-        val observer = LifecycleEventObserver { _, event ->
-            when (event) {
-                Lifecycle.Event.ON_RESUME ->
-                    sensor?.let { sm.registerListener(listener, it, SensorManager.SENSOR_DELAY_UI) }
-                Lifecycle.Event.ON_PAUSE -> sm.unregisterListener(listener)
-                else -> {}
-            }
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose {
-            lifecycleOwner.lifecycle.removeObserver(observer)
-            sm.unregisterListener(listener)
-        }
-    }
-
-    // Ajustes de aspecto
-    val lineThickness = 0.9.dp        // grosor de la línea (más chico = más fina)
-    val grayAlpha = 0.5f              // visibilidad cuando está torcida (más chico = más discreta)
-    val color by animateColorAsState(
-        if (level) Ui.amber.copy(alpha = 0.9f) else Color(0xFF9A968E).copy(alpha = grayAlpha),
-        label = "horizonColor"
-    )
-    // Derecho: los tramos se tocan (separación 0) y forman una sola barra. Torcido: se separan.
-    val gap by animateDpAsState(if (level) 0.dp else 6.dp, tween(120), label = "horizonGap")
-    if (!visible) return
-
-    Canvas(modifier) {
-        val c = center
-        val stroke = lineThickness.toPx()
-        val half = kotlin.math.hypot(size.width, size.height) / 2f      // la diagonal: la línea llega de borde a borde aun girada
-        val centerHalf = 40.dp.toPx()           // el tramo del medio mide 80 dp
-        val g = gap.toPx()
-        val spans: List<Pair<Float, Float>> = if (g < 0.5f) {
-            listOf(Pair(-half, half))               // derecho: una sola barra de borde a borde
-        } else {
-            listOf(
-                Pair(-half, -centerHalf - g),
-                Pair(-centerHalf, centerHalf),
-                Pair(centerHalf + g, half)
-            )
-        }
-        // Los tramos giran juntos con el horizonte (lo que sobra queda fuera del visor)
-        rotate(degrees = 90f * quarter + rel, pivot = c) {
-            spans.forEach { (a, b) ->
-                drawLine(Color.Black.copy(alpha = 0.18f), Offset(c.x + a, c.y), Offset(c.x + b, c.y), stroke * 2.2f, StrokeCap.Round)
-            }
-            spans.forEach { (a, b) ->
-                drawLine(color, Offset(c.x + a, c.y), Offset(c.x + b, c.y), stroke, StrokeCap.Round)
-            }
-        }
     }
 }
 
@@ -1760,239 +1525,71 @@ fun FlashToggle(enabled: Boolean, onToggle: () -> Unit, modifier: Modifier = Mod
     }
 }
 
-// ============================================================
-// PANTALLA DE PERMISO
-// ============================================================
+private fun describeCameraResolutions(camera: Camera, imageCapture: ImageCapture): String {
+    fun mp(w: Int, h: Int) = "%.1f MP".format(w.toLong() * h / 1e6)
+    fun fmt(sizes: Array<Size>?): String =
+        sizes?.sortedByDescending { it.width.toLong() * it.height }
+            ?.take(6)
+            ?.joinToString("\n") { "  ${it.width}x${it.height}  ${mp(it.width, it.height)}" }
+            ?: "  (ninguna)"
 
-@Composable
-fun PermissionScreen(
-    onRequest: () -> Unit,
-    onOpenSettings: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    Column(
-        modifier
-            .fillMaxSize()
-            .background(Ui.bg)
-            .padding(32.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
-        Text(
-            "Dusk necesita la cámara",
-            color = Ui.text,
-            fontSize = 20.sp,
-            fontWeight = FontWeight.Medium
+    val sb = StringBuilder()
+    val chosen = imageCapture.resolutionInfo?.resolution
+    sb.appendLine(
+        "CameraX eligió: " +
+            (chosen?.let { "${it.width}x${it.height}  ${mp(it.width, it.height)}" } ?: "(todavía no disponible)")
+    )
+    val info = Camera2CameraInfo.from(camera.cameraInfo)
+    sb.appendLine("Cámara id: ${info.cameraId}")
+    sb.appendLine("ZSL soportado: ${camera.cameraInfo.isZslSupported}")
+
+    val map = info.getCameraCharacteristic(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+    sb.appendLine("\nJPEG normales (los 6 más grandes):")
+    sb.appendLine(fmt(map?.getOutputSizes(ImageFormat.JPEG)))
+    sb.appendLine("\nJPEG de alta resolución (más lentos):")
+    sb.appendLine(fmt(map?.getHighResolutionOutputSizes(ImageFormat.JPEG)))
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        val max = info.getCameraCharacteristic(
+            CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION
         )
-        Spacer(Modifier.height(10.dp))
-        Text(
-            "Para sacar fotos hace falta el permiso de cámara. No se usa para nada más.",
-            color = Ui.muted,
-            fontSize = 14.sp,
-            textAlign = TextAlign.Center
-        )
-        Spacer(Modifier.height(28.dp))
-        PillButton("Dar permiso", onClick = onRequest, emphasized = true)
-        Spacer(Modifier.height(10.dp))
-        PillButton("Abrir ajustes", onClick = onOpenSettings)
+        sb.appendLine("\nModo resolución máxima (50 MP):")
+        sb.appendLine(fmt(max?.getOutputSizes(ImageFormat.JPEG)))
     }
+    return sb.toString()
 }
 
-@Composable
-private fun PillButton(
-    label: String,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-    emphasized: Boolean = false
-) {
-    val shape = RoundedCornerShape(50)
-    Box(
-        modifier
-            .clip(shape)
-            .background(if (emphasized) Ui.amber.copy(alpha = 0.16f) else Color.Transparent)
-            .border(1.dp, if (emphasized) Ui.amber else Ui.hairline, shape)
-            .clickable(onClick = onClick)
-            .padding(horizontal = 22.dp, vertical = 11.dp),
-        contentAlignment = Alignment.Center
-    ) {
-        Text(
-            label,
-            color = if (emphasized) Ui.amber else Ui.text,
-            fontSize = 13.sp,
-            fontWeight = FontWeight.Medium,
-            letterSpacing = 0.8.sp
-        )
-    }
-}
-
-// ============================================================
-// MENÚ DE OPCIONES (TRES PUNTITOS) Y MODO NOCHE
-// ============================================================
-
-/** Rango de fotogramas que permite exposiciones largas (el de menor mínimo), o null si el celular no tiene uno. */
-@OptIn(ExperimentalCamera2Interop::class)
-private fun nightFpsRange(camera: Camera): android.util.Range<Int>? {
-    val ranges = Camera2CameraInfo.from(camera.cameraInfo)
-        .getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
-        ?: return null
-    return ranges.filter { it.upper >= 15 && it.lower < 24 }.minByOrNull { it.lower }
-}
-
-/** Prende o apaga el modo noche sin reiniciar la cámara. */
-@OptIn(ExperimentalCamera2Interop::class)
-private fun applyNightMode(camera: Camera, enabled: Boolean) {
-    val control = Camera2CameraControl.from(camera.cameraControl)
-    if (enabled) {
-        val range = nightFpsRange(camera) ?: return
-        control.setCaptureRequestOptions(
-            CaptureRequestOptions.Builder()
-                .setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
-                .build()
-        )
-    } else {
-        control.clearCaptureRequestOptions()   // vuelve a lo que decide CameraX (30 fps fijos)
-    }
-}
-
-/** Una fila del menú: título, descripción opcional y un interruptor. */
-class MenuOption(
-    val title: String,
-    val subtitle: String?,
-    val checked: Boolean,
-    val onToggle: () -> Unit
-)
-
-/** Los tres puntitos del menú: solo los puntos, sin círculo. */
-@Composable
-fun MoreDotsButton(onClick: () -> Unit, modifier: Modifier = Modifier) {
-    Box(
-        modifier
-            .size(44.dp)
-            .clickable(
-                interactionSource = remember { MutableInteractionSource() },
-                indication = null,
-                onClick = onClick
-            )
-            .semantics { contentDescription = "Opciones" },
-        contentAlignment = Alignment.Center
-    ) {
-        Canvas(Modifier.size(width = 6.dp, height = 22.dp)) {
-            val r = 1.7.dp.toPx()
-            val x = size.width / 2f
-            listOf(0.1f, 0.5f, 0.9f).forEach { f ->
-                val center = Offset(x, size.height * f)
-                drawCircle(Color.Black.copy(alpha = 0.25f), r + 1.2.dp.toPx(), center)   // sombra suave
-                drawCircle(Color.White.copy(alpha = 0.7f), r, center)
-            }
+private fun describeAllCameras(provider: ProcessCameraProvider?): String {
+    if (provider == null) return "(sin proveedor de cámara)"
+    val sb = StringBuilder("Cámaras que Android le muestra a la app:\n")
+    provider.availableCameraInfos.forEach { info ->
+        val c2 = Camera2CameraInfo.from(info)
+        val facing = when (c2.getCameraCharacteristic(CameraCharacteristics.LENS_FACING)) {
+            CameraCharacteristics.LENS_FACING_BACK -> "trasera"
+            CameraCharacteristics.LENS_FACING_FRONT -> "frontal"
+            else -> "externa"
+        }
+        val focal = c2.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
+        val sensor = c2.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+        val pixels = c2.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
+        val fov = if (focal != null && sensor != null)
+            Math.toDegrees(2 * atan(sensor.width / (2.0 * focal))).roundToInt() else null
+        val zoom = info.zoomState.value
+        sb.appendLine("• id ${c2.cameraId}: $facing")
+        sb.appendLine("   lente ${focal ?: "?"} mm · campo de visión ${fov ?: "?"}°")
+        sb.appendLine("   sensor ${pixels?.width}x${pixels?.height}")
+        sb.appendLine("   zoom ${zoom?.minZoomRatio ?: "?"}x a ${zoom?.maxZoomRatio ?: "?"}x")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            try {
+                @Suppress("UNCHECKED_CAST")
+                val key = CameraCharacteristics::class.java.getField("LOGICAL_MULTI_CAMERA_PHYSICAL_IDS").get(null) as? CameraCharacteristics.Key<Set<String>>
+                if (key != null) {
+                    val phys = c2.getCameraCharacteristic(key)
+                    if (!phys.isNullOrEmpty()) sb.appendLine("   cámaras físicas: ${phys.joinToString()}")
+                }
+            } catch (_: Exception) {}
         }
     }
+    return sb.toString()
 }
 
-/** Menú desplegable propio (oscuro, bordes redondeados). Tocar afuera o "atrás" lo cierra. */
-@Composable
-fun OptionsMenu(
-    expanded: Boolean,
-    options: List<MenuOption>,
-    onDismiss: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    BackHandler(enabled = expanded) { onDismiss() }
-    Box(modifier) {
-        if (expanded) {
-            // Capa invisible: tocar fuera del menú lo cierra
-            Box(
-                Modifier
-                    .fillMaxSize()
-                    .clickable(
-                        interactionSource = remember { MutableInteractionSource() },
-                        indication = null,
-                        onClick = onDismiss
-                    )
-            )
-        }
-        AnimatedVisibility(
-            visible = expanded,
-            enter = fadeIn(tween(120)) +
-                scaleIn(tween(120), initialScale = 0.92f, transformOrigin = TransformOrigin(1f, 0f)),
-            exit = fadeOut(tween(100)),
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(top = 52.dp, end = 12.dp)
-        ) {
-            val shape = RoundedCornerShape(18.dp)
-            Column(
-                Modifier
-                    .width(230.dp)
-                    .background(Color(0xFF17171A).copy(alpha = 0.96f), shape)
-                    .border(1.dp, Ui.hairline, shape)
-                    .padding(vertical = 6.dp)
-            ) {
-                options.forEach { MenuSwitchRow(it) }
-            }
-        }
-    }
-}
-
-@Composable
-private fun MenuSwitchRow(option: MenuOption) {
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .clickable(onClick = option.onToggle)
-            .padding(horizontal = 16.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Column(Modifier.weight(1f)) {
-            Text(option.title, color = Ui.text, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-            if (option.subtitle != null) {
-                Text(option.subtitle, color = Ui.muted, fontSize = 11.sp)
-            }
-        }
-        Spacer(Modifier.width(12.dp))
-        MiniSwitch(option.checked)
-    }
-}
-
-@Composable
-private fun MiniSwitch(checked: Boolean) {
-    val track by animateColorAsState(if (checked) Ui.amber else Ui.hairline, label = "switchTrack")
-    val thumbX by animateDpAsState(if (checked) 18.dp else 2.dp, tween(120), label = "switchThumb")
-    Box(
-        Modifier
-            .size(width = 38.dp, height = 22.dp)
-            .background(track, RoundedCornerShape(50))
-    ) {
-        Box(
-            Modifier
-                .offset(x = thumbX, y = 2.dp)
-                .size(18.dp)
-                .background(Ui.text, CircleShape)
-        )
-    }
-}
-
-/** Lunita del modo noche: solo el contorno, en ámbar, sin círculo. */
-@Composable
-fun MoonIndicator(modifier: Modifier = Modifier) {
-    val moon = remember {
-        Path.combine(
-            PathOperation.Difference,
-            Path().apply { addOval(Rect(3.5f, 3.5f, 20.5f, 20.5f)) },   // luna llena (centro 12,12)
-            Path().apply { addOval(Rect(9.4f, 1.4f, 23f, 15f)) }        // círculo que la "muerde"
-        )
-    }
-    Box(
-        modifier
-            .size(44.dp)
-            .semantics { contentDescription = "Modo noche activado" },
-        contentAlignment = Alignment.Center
-    ) {
-        Canvas(Modifier.size(22.dp)) {
-            val k = size.width / 24f
-            scale(k, k, pivot = Offset.Zero) {
-                drawPath(moon, Color.Black.copy(alpha = 0.25f), style = Stroke(width = 3.2f, join = StrokeJoin.Round))
-                drawPath(moon, Ui.amber, style = Stroke(width = 1.7f, join = StrokeJoin.Round))
-            }
-        }
-    }
-}
